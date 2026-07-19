@@ -152,7 +152,9 @@ class PollTelegramUpdatesTests(unittest.TestCase):
         cfg, state = self._cfg(), _state()
         with mock.patch.object(notify, "get_updates", return_value=[_update(10, "status")]), \
              mock.patch.object(notify, "send_telegram", return_value=True) as sent:
-            out = notify.poll_telegram_updates(cfg, state, Path("/no/repo"), status_provider=lambda: "STATUS-OK")
+            out = notify.poll_telegram_updates(
+                cfg, state, Path("/no/repo"), status_provider=lambda: "STATUS-OK"
+            )
         self.assertEqual(out, ["status"])
         sent.assert_called_once()
         self.assertEqual(sent.call_args.args[2], "STATUS-OK")

@@ -115,11 +115,14 @@ def update_seat(
     cooldown_until: str | None = "__unset__",
     last_percent: float | None = None,
     last_resets_at: str | None = None,
+    last_seen_at: str | None = None,
     consecutive_failures: int | None = None,
     note: str | None = "__unset__",
 ) -> None:
     """Merge-update one seat's entry. Sentinel `"__unset__"` means "leave unchanged" for the
-    two fields (`cooldown_until`, `note`) whose real value is legitimately `None`.
+    two fields (`cooldown_until`, `note`) whose real value is legitimately `None`. `last_seen_at`
+    (ISO-8601 of when this seat's usage was last actually observed) is set only when provided —
+    it lets a read-only observer (the monitor) label a fallback reading with its age.
     """
     key = _seat_key(seat_dir)
     entry = state["seats"].setdefault(
@@ -141,6 +144,8 @@ def update_seat(
         entry["lastPercent"] = last_percent
     if last_resets_at is not None:
         entry["lastResetsAt"] = last_resets_at
+    if last_seen_at is not None:
+        entry["lastSeenAt"] = last_seen_at
     if consecutive_failures is not None:
         entry["consecutiveFailures"] = consecutive_failures
     if note != "__unset__":

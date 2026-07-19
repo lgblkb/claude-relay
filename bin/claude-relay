@@ -20,8 +20,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from relay import config as config_mod  # noqa: E402
-from relay import fleet, gadkit, loop  # noqa: E402
-from relay import cooldown  # noqa: E402
+from relay import cooldown, fleet, gadkit, loop, monitor  # noqa: E402
 
 
 def _parse_ceiling_overrides(raw: list[str] | None) -> dict[str, float]:
@@ -113,14 +112,65 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     repo = Path(repo_str).expanduser().resolve()
     result = gadkit.resolve_owner_decision(repo, args.decision_id, args.answer)
     if not result.found:
-        print(f"no open ownerDecision with id={args.decision_id!r} found in {result.index_path}", file=sys.stderr)
+        print(
+            f"no open ownerDecision with id={args.decision_id!r} found in {result.index_path}",
+            file=sys.stderr,
+        )
         return 1
     print(f"resolved {args.decision_id!r} in {result.index_path}: {result.decision}")
     return 0
 
 
-def cmd_monitor(_args: argparse.Namespace) -> int:
-    print("monitor is Phase 2 (tmux panes: supervisor log / all-seats usage table / git log). Not implemented yet.")
+def _config_path_arg(args: argparse.Namespace) -> Path | None:
+    return Path(args.config).expanduser() if getattr(args, "config", None) else None
+
+
+def cmd_seats(args: argparse.Namespace) -> int:
+    """Print the live+fallback all-seats usage table. `--watch [SECS]` refreshes in place
+    (default 60s); without it, prints a single snapshot and exits (handy over SSH).
+    """
+    cfg = _load_config(args)
+    watch = getattr(args, "watch", None)
+    if watch is None:
+        monitor.run_seats_panel(cfg, once=True)
+    else:
+        interval = float(watch) if watch else monitor.DEFAULT_SEATS_INTERVAL_S
+        monitor.run_seats_panel(cfg, interval=interval, once=False)
+    return 0
+
+
+def cmd_monitor(args: argparse.Namespace) -> int:
+    """Observe-only tmux cockpit: supervisor log · all-seats usage table · git/gad status.
+    NEVER launches `run` — start the loop yourself (another pane / SSH).
+    """
+    cfg = _load_config(args)
+    repo_str = args.repo or cfg.repo
+    repo = Path(repo_str).expanduser().resolve() if repo_str else None
+    try:
+        monitor.launch(
+            cfg,
+            repo,
+            session=args.session,
+            interval=float(args.interval),
+            config_path=_config_path_arg(args),
+            attach=not args.no_attach,
+        )
+    except monitor.MonitorError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"monitor session {args.session!r} is up (tmux attach -t {args.session})")
+    return 0
+
+
+def cmd_panel(args: argparse.Namespace) -> int:
+    """Internal: the process each tmux pane runs. Not meant to be called directly."""
+    cfg = _load_config(args)
+    if args.which == "log":
+        monitor.run_log_panel(cfg.log_dir)
+    elif args.which == "repo":
+        repo_str = getattr(args, "repo", None) or cfg.repo
+        repo = Path(repo_str).expanduser().resolve() if repo_str else None
+        monitor.run_repo_panel(repo)
     return 0
 
 
@@ -133,7 +183,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("repo", nargs="?", help="absolute path to the target repo (else config.toml's `repo`)")
     p_run.add_argument("--once", action="store_true", help="perform a single iteration and exit")
     p_run.add_argument("--dry-run", action="store_true", help="print the plan/seat/argv; spawn nothing")
-    p_run.add_argument("--profile", choices=("budget", "balanced"), help="override [gadkit].tier for this run")
+    p_run.add_argument(
+        "--profile", choices=("budget", "balanced"), help="override [gadkit].tier for this run"
+    )
     p_run.add_argument(
         "--ceiling",
         action="append",
@@ -154,8 +206,37 @@ def build_parser() -> argparse.ArgumentParser:
     p_resolve.add_argument("--repo", help="absolute path to the target repo (else config.toml's `repo`)")
     p_resolve.set_defaults(func=cmd_resolve)
 
-    p_monitor = sub.add_parser("monitor", help="(Phase 2 stub)")
+    p_seats = sub.add_parser("seats", help="print the live+fallback all-seats usage table")
+    p_seats.add_argument(
+        "--watch",
+        nargs="?",
+        const="",
+        metavar="SECS",
+        help="refresh in place every SECS seconds (default 60); omit for a single snapshot",
+    )
+    p_seats.set_defaults(func=cmd_seats)
+
+    p_monitor = sub.add_parser("monitor", help="observe-only tmux cockpit (log · seats · git/gad)")
+    p_monitor.add_argument(
+        "repo", nargs="?", help="repo to watch in the git/gad pane (else config.toml's `repo`)"
+    )
+    p_monitor.add_argument("--session", default=monitor.DEFAULT_SESSION, help="tmux session name")
+    p_monitor.add_argument(
+        "--interval", type=float, default=monitor.DEFAULT_SEATS_INTERVAL_S,
+        help="seats-table refresh interval in seconds (default 60)",
+    )
+    p_monitor.add_argument(
+        "--no-attach", action="store_true",
+        help="build the session but don't attach (then `tmux attach -t <session>`)",
+    )
     p_monitor.set_defaults(func=cmd_monitor)
+
+    # Internal: the per-pane processes `monitor` spawns via tmux. No `help=` -> stays out of the
+    # command-description list (it still appears in the {choices} metavar; that's an argparse limit).
+    p_panel = sub.add_parser("_panel")
+    p_panel.add_argument("which", choices=("log", "repo"))
+    p_panel.add_argument("--repo", help="repo path for the repo panel (else config.toml's `repo`)")
+    p_panel.set_defaults(func=cmd_panel)
 
     return parser
 

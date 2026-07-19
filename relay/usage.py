@@ -77,7 +77,16 @@ class RateLimited(UsageError):
 
 
 class UsageFetchError(UsageError):
-    """Any other HTTP or network failure talking to the usage endpoint."""
+    """Any other HTTP or network failure talking to the usage endpoint. `status_code` carries the
+    HTTP status when the failure was an HTTP error (e.g. 401 = token present but rejected — the
+    seat needs a token refresh, which a `claude` launch performs), and is None for a pure network
+    error. Callers that only need "did it work?" can keep catching `UsageError`; the field lets a
+    read-only observer (the monitor) explain *why* a poll failed without changing control flow.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclasses.dataclass(frozen=True)
@@ -305,7 +314,9 @@ def fetch_usage(seat_dir: Path, timeout: float = DEFAULT_TIMEOUT_S) -> UsageSnap
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
             retry_after_s = float(retry_after) if retry_after and retry_after.isdigit() else None
             raise RateLimited(retry_after_s) from exc
-        raise UsageFetchError(f"usage endpoint returned HTTP {exc.code} for seat {seat_dir.name}") from exc
+        raise UsageFetchError(
+            f"usage endpoint returned HTTP {exc.code} for seat {seat_dir.name}", status_code=exc.code
+        ) from exc
     except urllib.error.URLError as exc:
         raise UsageFetchError(f"network error reaching usage endpoint: {exc.reason}") from exc
     finally:

@@ -236,9 +236,16 @@ v1 — calibration deferred to Phase 2 per §4.)
     reachable), and, if the Telegram sink is chosen, as a bot reply the supervisor polls
     and maps to the same disk edit. Supervisor parks the repo, keeps serving other work,
     and auto-resumes when it sees the resolution on disk.
-- **Monitor is Phase 2** (optional): tmux panes (supervisor log · all-seats usage table ·
-  `git log`/`.gad/BUILD_STATUS.md`). The all-seats live table needs standalone OAuth
-  refresh (to poll idle seats without launching) — hence Phase 2, not on the v1 path.
+- **Monitor (Phase 2, implemented — observe-only):** `claude-relay monitor` builds a 3-pane
+  tmux cockpit (supervisor log = newest `run-*.log` followed live · all-seats usage table ·
+  `git log`/`.gad/BUILD_STATUS.md`); `claude-relay seats [--watch]` is the table on its own
+  (no tmux; ideal over SSH). The table is **live + fallback**: each seat polled live (shared
+  `poll_ttl`/~5-min discipline), falling back to `state.json`'s last-known reading (labelled
+  `stale·N` by age, or `auth?` for an expired token) when a live poll fails. It is a *dashboard*,
+  never an input to selection — `pick_seat()` polls live at decision time regardless. Deliberately
+  observe-only: it never launches a run. STILL deferred: a standalone OAuth refresh so *idle*
+  seats poll truly-live between runs (today they show last-known); no monitor needs it, and even
+  `claude-hud` doesn't do it.
 
 ## 8. Config (`config.toml`, all optional)
 ```toml
@@ -254,8 +261,8 @@ max_units  = 0                    # 0 = until DONE
 [telegram] bot_token = "env:CLAUDE_RELAY_TELEGRAM_BOT_TOKEN"; chat_id = "…"  # or inline (chmod 600)
 [notify]  sink = "telegram"
 ```
-CLI: `claude-relay run [repo] [--once] [--dry-run]`, `status`, `login-check`,
-(`monitor` in Phase 2).
+CLI: `claude-relay run [repo] [--once] [--dry-run]`, `status`, `login-check`, `resolve`,
+`seats [--watch]`, `monitor [repo]`.
 
 ## 9. Failure modes / edge cases
 All-cooling → sleep to earliest resets_at (+notify if long). 0 usable seats → notify
@@ -276,8 +283,9 @@ Recovery never destroys unrelated user work (Invariant #6).
   + detector + config + install/verify + **minimal shellular notifier**. Runs on live
   named seats. `--dry-run`/`--once` for testing. First real run also validates the
   token-target on a full generation.
-- **Phase 2:** tmux monitor + standalone OAuth refresh (→ all-seats live table) +
-  calibrated `--max N` batching (stream-json token cost).
+- **Phase 2:** tmux monitor ✅ (observe-only: `monitor`/`seats`, live+fallback table) +
+  standalone OAuth refresh (→ *idle*-seat truly-live table; still deferred) + calibrated
+  `--max N` batching (stream-json token cost; still deferred).
 - **Phase 3:** more notifier sinks + dedupe polish.
 - **Later / v2 boundaries:** mobile web dashboard; multi-repo concurrent off one pool
   (today: single-repo, global lock); provider/workload interface extraction; multi-

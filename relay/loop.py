@@ -203,6 +203,7 @@ def _record_usage(
         cooldown_until=cooldown_until,
         last_percent=usage_mod.session_percent(usage),
         last_resets_at=resets.isoformat() if resets is not None else None,
+        last_seen_at=cooldown.now_iso(),
     )
 
 
@@ -415,6 +416,7 @@ def status_report(config: Config, state: dict[str, Any]) -> dict[str, Any]:
                 "needs_login": seat.needs_login,
                 "cooldownUntil": entry.get("cooldownUntil"),
                 "lastPercent": entry.get("lastPercent"),
+                "lastSeenAt": entry.get("lastSeenAt"),
                 "consecutiveFailures": entry.get("consecutiveFailures", 0),
                 "note": entry.get("note"),
             }

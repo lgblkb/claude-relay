@@ -208,7 +208,9 @@ def _help_text(repo: Path) -> str:
         "",
     ]
     decisions = gadkit.open_owner_decisions(Path(repo))
-    lines.append(gadkit.format_decisions_for_operator(decisions) if decisions else "No open decisions right now.")
+    lines.append(
+        gadkit.format_decisions_for_operator(decisions) if decisions else "No open decisions right now."
+    )
     return "\n".join(lines)
 
 

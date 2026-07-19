@@ -11,8 +11,10 @@ See `DESIGN.md` for the full design (architecture, the rotation loop, seat-selec
 thresholds, the gad-kit recovery-routing logic, state schema, notifier, config, and failure
 modes). This is a **Phase 1** implementation: the rotation loop, fleet/usage/cooldown/runner,
 the gad-kit triage/recovery brain, the detector, config, install/verify, and a minimal
-Telegram-first notifier. Phase 2 (tmux monitor, standalone OAuth refresh, calibrated `--max N`
-batching) is out of scope here — `claude-relay monitor` is a stub that says so.
+Telegram-first notifier — plus the **observe-only tmux monitor** (`monitor` / `seats`). The rest
+of Phase 2 (standalone OAuth refresh so *idle* seats poll truly-live, calibrated `--max N`
+batching) is still out of scope here — see "Monitoring" below for what the monitor does and
+doesn't show.
 
 ## Requirements
 
@@ -66,7 +68,9 @@ claude-relay run <repo>             # the full rotation loop (blocks; Ctrl-C to 
 claude-relay status                 # offline seat + triage snapshot as JSON
 claude-relay login-check            # list seats + login state
 claude-relay resolve <id> <answer>  # durably resolve an ownerDecision (unblocks AWAITING_HUMAN)
-claude-relay monitor                # Phase 2 stub
+claude-relay seats                  # print the live+fallback all-seats usage table once (great over SSH)
+claude-relay seats --watch [SECS]   # ...refreshing in place every SECS (default 60)
+claude-relay monitor [repo]         # observe-only tmux cockpit (log · seats · git/gad); never launches a run
 ```
 
 `repo` may also be set once in `config.toml` and omitted from every CLI invocation.
@@ -114,6 +118,26 @@ pushed to Telegram. Reply `resolve <id> <answer>` or `status` in that chat, or r
 `claude-relay resolve <id> <answer>` over SSH — both go through the exact same durable disk
 edit (`.gad/generations-index.json`'s matching `ownerDecisions[]` entry marked `"resolved"`),
 which is what actually unblocks the parked repo (not a chat reply).
+
+## Monitoring
+
+`claude-relay monitor [repo]` opens an **observe-only** tmux cockpit — three panes:
+
+- **supervisor log** (left): a `tail -F` that always follows the newest `run-*.log` (each `claude
+  -p` generation writes its own), switching automatically as generations turn over;
+- **all-seats usage table** (top-right): auto-refreshing, **live + fallback** — each seat is polled
+  live against the OAuth usage endpoint (same `poll_ttl`/~5-min self-rate-limit discipline the loop
+  uses); a seat whose token has expired (`auth?`) or is momentarily unreachable falls back to the
+  last-known reading in `state.json`, labelled `stale·N` with its age;
+- **git log + `.gad/BUILD_STATUS.md`** (bottom-right) for the watched repo.
+
+It is deliberately **observe-only**: `monitor` NEVER starts a run — you launch `claude-relay run`
+yourself (another pane, or SSH). The monitor is not an input to any decision; seat *selection*
+correctness lives entirely in the loop's `pick_seat()`, which polls live at the moment it decides.
+Requires `tmux`; if it's absent, use `claude-relay seats --watch` (the same table, no tmux) — which
+is also the best thing to run over SSH from a phone. Idle seats can't be polled truly-live without a
+standalone OAuth token refresh (still deferred), so between runs an idle seat shows its last-known
+`state.json` reading (or `auth?` if its token has since expired — a run refreshes it).
 
 ## Tests
 
