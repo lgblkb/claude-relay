@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""claude-relay CLI. Subcommands: run, status, login-check, resolve, monitor (Phase 2 stub).
+
+This script is installed as a symlink into `~/.local/bin/claude-relay` (see install.sh) — it
+resolves its own real location (following the symlink) so `import relay` works regardless of
+where it is invoked from or symlinked to. No hardcoded paths.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+_SCRIPT_PATH = os.path.realpath(__file__)
+_REPO_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_PATH))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from relay import config as config_mod  # noqa: E402
+from relay import fleet, gadkit, loop  # noqa: E402
+from relay import cooldown  # noqa: E402
+
+
+def _parse_ceiling_overrides(raw: list[str] | None) -> dict[str, float]:
+    """Parse repeatable `--ceiling <seatname>=<pct>` tokens into a dict. Raises SystemExit(2)
+    with a clear message on a malformed token rather than silently ignoring it.
+    """
+    overrides: dict[str, float] = {}
+    for token in raw or []:
+        name, sep, pct_str = token.partition("=")
+        if not sep or not name or not pct_str:
+            print(f"error: --ceiling expects <seatname>=<pct>, got {token!r}", file=sys.stderr)
+            raise SystemExit(2)
+        try:
+            overrides[name] = float(pct_str)
+        except ValueError:
+            print(f"error: --ceiling percent must be a number, got {token!r}", file=sys.stderr)
+            raise SystemExit(2) from None
+    return overrides
+
+
+def _load_config(args: argparse.Namespace) -> config_mod.Config:
+    config_path = Path(args.config).expanduser() if getattr(args, "config", None) else None
+    overrides: dict[str, object] = {}
+    if getattr(args, "profile", None):
+        overrides["profile"] = args.profile
+    ceiling_tokens = getattr(args, "ceiling", None)
+    if ceiling_tokens:
+        overrides["ceiling_overrides"] = _parse_ceiling_overrides(ceiling_tokens)
+    try:
+        return config_mod.load_config(config_path, repo=getattr(args, "repo", None), **overrides)
+    except config_mod.ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    cfg = _load_config(args)
+    repo_str = cfg.repo
+    if not repo_str:
+        print("error: no repo given (pass a path, or set `repo` in config.toml)", file=sys.stderr)
+        return 2
+    repo = Path(repo_str).expanduser().resolve()
+    if not repo.is_dir():
+        print(f"error: repo path does not exist or is not a directory: {repo}", file=sys.stderr)
+        return 2
+
+    if args.dry_run:
+        state = cooldown.load_state(cfg.state_path)
+        preview = loop.dry_run_preview(repo, cfg, state)
+        print(json.dumps(preview, indent=2, default=str))
+        return 0
+
+    try:
+        return loop.run(repo, cfg, once=args.once)
+    except loop.LockError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    cfg = _load_config(args)
+    state = cooldown.load_state(cfg.state_path)
+    report = loop.status_report(cfg, state)
+    print(json.dumps(report, indent=2, default=str))
+    return 0
+
+
+def cmd_login_check(args: argparse.Namespace) -> int:
+    cfg = _load_config(args)
+    seats = fleet.discover_seats(cfg.effective_exclude())
+    if not seats:
+        print("no seats discovered (looked for ~/.claude-* directories with .credentials.json)")
+        return 1
+    exit_code = 0
+    for seat in seats:
+        status = "usable" if seat.usable else "needs-login"
+        if seat.needs_login:
+            exit_code = 1
+        print(f"{status:12s} {seat.name:20s} {seat.path}")
+    return exit_code
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    cfg = _load_config(args)
+    repo_str = args.repo or cfg.repo
+    if not repo_str:
+        print("error: no repo given (pass --repo, or set `repo` in config.toml)", file=sys.stderr)
+        return 2
+    repo = Path(repo_str).expanduser().resolve()
+    result = gadkit.resolve_owner_decision(repo, args.decision_id, args.answer)
+    if not result.found:
+        print(f"no open ownerDecision with id={args.decision_id!r} found in {result.index_path}", file=sys.stderr)
+        return 1
+    print(f"resolved {args.decision_id!r} in {result.index_path}: {result.decision}")
+    return 0
+
+
+def cmd_monitor(_args: argparse.Namespace) -> int:
+    print("monitor is Phase 2 (tmux panes: supervisor log / all-seats usage table / git log). Not implemented yet.")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="claude-relay", description=__doc__)
+    parser.add_argument("--config", help="path to config.toml (default: ~/.claude-relay/config.toml)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_run = sub.add_parser("run", help="run the rotation loop")
+    p_run.add_argument("repo", nargs="?", help="absolute path to the target repo (else config.toml's `repo`)")
+    p_run.add_argument("--once", action="store_true", help="perform a single iteration and exit")
+    p_run.add_argument("--dry-run", action="store_true", help="print the plan/seat/argv; spawn nothing")
+    p_run.add_argument("--profile", choices=("budget", "balanced"), help="override [gadkit].tier for this run")
+    p_run.add_argument(
+        "--ceiling",
+        action="append",
+        metavar="SEATNAME=PCT",
+        help="override a seat's synthetic rotation ceiling for this run (repeatable, e.g. --ceiling sam=80)",
+    )
+    p_run.set_defaults(func=cmd_run)
+
+    p_status = sub.add_parser("status", help="print seat + triage status as JSON")
+    p_status.set_defaults(func=cmd_status)
+
+    p_login = sub.add_parser("login-check", help="list discovered seats and their login state")
+    p_login.set_defaults(func=cmd_login_check)
+
+    p_resolve = sub.add_parser("resolve", help="mark an ownerDecision resolved in generations-index.json")
+    p_resolve.add_argument("decision_id")
+    p_resolve.add_argument("answer")
+    p_resolve.add_argument("--repo", help="absolute path to the target repo (else config.toml's `repo`)")
+    p_resolve.set_defaults(func=cmd_resolve)
+
+    p_monitor = sub.add_parser("monitor", help="(Phase 2 stub)")
+    p_monitor.set_defaults(func=cmd_monitor)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

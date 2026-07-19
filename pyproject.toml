@@ -1,0 +1,22 @@
+[project]
+name = "claude-relay"
+version = "0.1.0"
+description = "Stdlib-only supervisor that rotates a headless Claude Code workload across seats as each account's 5-hour usage window fills up."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S"]
+ignore = [
+  "S603", # subprocess call with a fixed, non-shell argv (git/claude) — reviewed at each call site
+  "S607", # partial executable path ("git", "claude") — resolved via PATH deliberately (portability)
+  "S105", # "possible hardcoded password" false-positives on token_target's literal default ("+2M")
+  "S106", # same false-positive, matched via keyword-argument form (test fixtures use Config(token_target=...))
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "S603", "S607"]

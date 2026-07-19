@@ -1,0 +1,86 @@
+# claude-relay config — copy to ~/.claude-relay/config.toml (install.sh does this for you if
+# the file doesn't exist yet). Every key is optional; claude-relay runs on built-in defaults
+# with an empty file. All CLI flags override the matching key here.
+
+# Absolute path to the target repo. Can also be given as a positional CLI argument to
+# `claude-relay run <repo>` (the CLI argument wins if both are given).
+repo = "/abs/path/to/your/gad-bootstrapped/repo"
+
+# Seat names (the suffix after "~/.claude-", e.g. "~/.claude-yerasyl" -> "yerasyl") to never
+# pool, even if discovered. Bare "~/.claude" is ALWAYS excluded in v1 regardless of this list
+# (see README.md / DESIGN.md §0 — its .claude.json lives at ~/.claude.json, so
+# CLAUDE_CONFIG_DIR=~/.claude produces a degraded session). Any seat marked `main = true` or
+# `exclude = true` under a [seats.<name>] table below is ALSO kept out of the pool — you don't
+# need to list it here too.
+exclude = ["yerasyl"]
+
+# How long (seconds) a usage reading is trusted before re-polling the same seat.
+poll_ttl = 90
+
+# Free-text directive appended to the `/gad-run` prompt so a long generation doesn't die on an
+# undocumented per-turn ceiling. Its exact effect is unverified until the first real run (see
+# gadkit.py's `command()` docstring and this generation's uncertainty-ledger.jsonl).
+token_target = "+2M"
+
+# Phase 2 batching knob (`--max N`); unused in Phase 1, which always runs `--max 1`. Also used
+# by the loop as a hard cap on completed RUN/FINISH units THIS invocation (0 = unlimited).
+max_units = 0
+
+# Wall-clock cap (seconds) on one `claude` invocation before claude-relay kills the whole
+# process group and rotates off that seat. ~2 hours is generous for one `--max 1` generation;
+# raise it if your generations genuinely run longer.
+run_timeout_s = 7200
+
+[defaults]
+# The SYNTHETIC per-seat rotation ceiling — deliberately LOWER than Claude's real 100% usage
+# cap. claude-relay rotates a seat off (or refuses to start a unit on it) once its real
+# active-session `percent` reaches this value, or its `severity` is non-"normal". This
+# replaces the old flat high_pct/start_cap pair and is what actually avoids the "90-99% dead
+# zone" (a seat stalling between an early-warning percent and outright exhaustion used to be
+# misclassified as a dead agent rather than a seat that had simply hit its own ceiling).
+ceiling_pct = 70
+# pick_seat() only STARTS a new unit on a seat whose percent is below `ceiling_pct -
+# start_margin` (it may still finish a unit already running closer to the ceiling).
+start_margin = 5
+
+# Per-seat overrides — one [seats.<name>] table per seat you want to special-case. `<name>` is
+# the suffix after "~/.claude-" (e.g. "~/.claude-sam" -> "sam").
+# [seats.sam]
+# ceiling_pct = 85          # give this seat a higher (or lower) ceiling than [defaults]
+# [seats.dias]
+# main = true               # a daily-driver seat you still use interactively — kept OUT of the pool
+# [seats.retired-seat]
+# exclude = true            # equivalent to listing it in the top-level `exclude` array above
+
+[gadkit]
+# gad-kit's own slash-command flag is literally `--profile budget|balanced`; claude-relay
+# calls the same concept a "tier" internally to avoid the config-name collision (see
+# DESIGN.md's header and gadkit.py's module docstring).
+tier = "budget"
+# Extra tokens appended verbatim to the end of every /gad-run, /gad-generation, and
+# /gad-finish prompt this tool builds (e.g. ["--milestone"] or ["--skip-premortem"]).
+extra_flags = []
+
+[telegram]
+# Recommended default notify-out sink + the resolve-in reply channel. Secrets may also come
+# from the CLAUDE_RELAY_TELEGRAM_BOT_TOKEN / CLAUDE_RELAY_TELEGRAM_CHAT_ID environment
+# variables instead (those win over this file). NEVER logged.
+bot_token = ""
+chat_id = ""
+
+[notify]
+# "telegram" (default) | "stdout" | "command" | "webhook" | "shellular" (optional, never
+# depended on — see notify.py).
+sink = "telegram"
+# TRUST BOUNDARY: `command`, `shellular_command`, and `webhook_url` below are EXECUTED (a local
+# shell command) or POSTed to (a URL) VERBATIM by claude-relay, with no sandboxing. Only ever
+# set these from your own local, trusted config.toml — never populate this file from a remote,
+# shared, or otherwise untrusted source, and never let anything else write to it on your behalf.
+#
+# Used only when sink = "command": a shell command run with the notification text piped to
+# its stdin.
+# command = "notify-send claude-relay"
+# Used only when sink = "webhook": a URL that receives {"text": "<message>"} as a JSON POST.
+# webhook_url = "https://example.com/hooks/claude-relay"
+# Used only when sink = "shellular" (optional sink, never required).
+# shellular_command = "shellular notify --text -"

@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Secrets & runtime state — NEVER commit. The real config (with the Telegram bot token)
+# lives at ~/.claude-relay/config.toml, outside this repo; config.example.toml is the
+# secret-free template. These patterns are a defensive backstop against an accidental drop.
+config.toml
+.credentials.json
+*.credentials.json
+state.json
+*.log
+
+# Stray gad-kit build artifacts (incomplete generation scaffolding, not real history).
+.gad/
