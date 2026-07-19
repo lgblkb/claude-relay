@@ -126,6 +126,7 @@ def build_seat_rows(
     now = now or dt.datetime.now(dt.UTC)
     log_dir = log_dir if log_dir is not None else config.log_dir
     seats = fleet.discover_seats(config.effective_exclude())
+    disabled = cooldown.disabled_seats(state)
     latest = latest_run_seat(log_dir)
     rows: list[SeatRow] = []
     for seat in seats:
@@ -167,7 +168,9 @@ def build_seat_rows(
                 percent=percent,
                 resets_at=resets_at,
                 weekly=weekly,
-                state_label=_state_label(seat, cooling, entry, now, latest),
+                state_label=_state_label(
+                    seat, cooling, entry, now, latest, disabled=seat.name in disabled
+                ),
                 source=source,
                 age_s=age_s,
             )
@@ -181,7 +184,11 @@ def _state_label(
     entry: dict[str, Any],
     now: dt.datetime,
     latest: str | None,
+    *,
+    disabled: bool = False,
 ) -> str:
+    if disabled:
+        return "disabled"  # operator switched it off — pick_seat skips it regardless of the rest
     if seat.needs_login:
         return "needs-login"
     if cooling:

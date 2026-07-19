@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from relay import cli
+from relay import cli, cooldown
 from relay import config as config_mod
 
 
@@ -23,7 +23,10 @@ class ParserTests(unittest.TestCase):
             ["run", "/x", "--dry-run"],
             ["status"],
             ["login-check"],
-            ["init", "--force"],
+            ["init", "--force", "--no-adopt"],
+            ["adopt", "--name", "default", "--force"],
+            ["disable", "sam"],
+            ["enable", "sam"],
             ["resolve", "d1", "yes"],
             ["seats", "--watch", "30"],
             ["monitor", "/x"],
@@ -31,6 +34,101 @@ class ParserTests(unittest.TestCase):
         ):
             args = parser.parse_args(argv)
             self.assertTrue(callable(getattr(args, "func", None)), f"no func for {argv!r}")
+
+
+def _fake_home_with_main_login(tmp: str) -> Path:
+    """A temp HOME whose bare ~/.claude carries a .credentials.json (the 'main account')."""
+    home = Path(tmp)
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / ".credentials.json").write_text('{"claudeAiOauth": {}}', encoding="utf-8")
+    return home
+
+
+class AdoptTests(unittest.TestCase):
+    def test_adopt_copies_bare_claude_into_named_seat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = _fake_home_with_main_login(tmp)
+            res = cli._adopt_default_seat("default", home=home)
+            self.assertEqual(res.status, "adopted")
+            seat_creds = home / ".claude-default" / ".credentials.json"
+            self.assertTrue(seat_creds.is_file())
+            self.assertEqual(stat.S_IMODE(seat_creds.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE((home / ".claude-default").stat().st_mode), 0o700)
+            # source is never modified
+            self.assertTrue((home / ".claude" / ".credentials.json").is_file())
+
+    def test_adopt_is_idempotent_without_force(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = _fake_home_with_main_login(tmp)
+            cli._adopt_default_seat("default", home=home)
+            (home / ".claude-default" / ".credentials.json").write_text("REFRESHED", encoding="utf-8")
+            res = cli._adopt_default_seat("default", home=home)  # no force
+            self.assertEqual(res.status, "exists")
+            # must NOT clobber the seat's own (refreshed) token
+            self.assertEqual(
+                (home / ".claude-default" / ".credentials.json").read_text(encoding="utf-8"), "REFRESHED"
+            )
+
+    def test_adopt_no_source_when_no_bare_login(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            res = cli._adopt_default_seat("default", home=Path(tmp))
+            self.assertEqual(res.status, "no-source")
+            self.assertFalse((Path(tmp) / ".claude-default").exists())
+
+    def test_maybe_adopt_if_empty_skips_when_a_seat_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = _fake_home_with_main_login(tmp)
+            # a pre-existing usable named seat
+            (home / ".claude-almas").mkdir()
+            (home / ".claude-almas" / ".credentials.json").write_text(
+                '{"claudeAiOauth": {"accessToken": "tok"}}', encoding="utf-8"
+            )
+            cfg = config_mod.Config(adopt_default="if-empty")
+            res = cli._maybe_adopt(cfg, name="default", no_adopt=False, home=home)
+            self.assertEqual(res.status, "skipped")
+            self.assertFalse((home / ".claude-default").exists())
+
+    def test_maybe_adopt_always_adopts_even_with_other_seats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = _fake_home_with_main_login(tmp)
+            (home / ".claude-almas").mkdir()
+            (home / ".claude-almas" / ".credentials.json").write_text(
+                '{"claudeAiOauth": {"accessToken": "tok"}}', encoding="utf-8"
+            )
+            cfg = config_mod.Config(adopt_default="always")
+            res = cli._maybe_adopt(cfg, name="default", no_adopt=False, home=home)
+            self.assertEqual(res.status, "adopted")
+            self.assertTrue((home / ".claude-default" / ".credentials.json").is_file())
+
+    def test_maybe_adopt_respects_no_adopt_and_never(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = _fake_home_with_main_login(tmp)
+            self.assertEqual(
+                cli._maybe_adopt(config_mod.Config(), name="default", no_adopt=True, home=home).status,
+                "skipped",
+            )
+            self.assertEqual(
+                cli._maybe_adopt(
+                    config_mod.Config(adopt_default="never"), name="default", no_adopt=False, home=home
+                ).status,
+                "skipped",
+            )
+            self.assertFalse((home / ".claude-default").exists())
+
+
+class DisableEnableTests(unittest.TestCase):
+    def test_disable_then_enable_roundtrips_in_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state = cooldown.load_state(state_path)
+            self.assertTrue(cooldown.set_seat_disabled(state, "sam", True))
+            self.assertFalse(cooldown.set_seat_disabled(state, "sam", True))  # already disabled
+            self.assertIn("sam", cooldown.disabled_seats(state))
+            cooldown.save_state(state_path, state)
+            reloaded = cooldown.load_state(state_path)  # persists across load
+            self.assertIn("sam", cooldown.disabled_seats(reloaded))
+            self.assertTrue(cooldown.set_seat_disabled(reloaded, "sam", False))
+            self.assertNotIn("sam", cooldown.disabled_seats(reloaded))
 
 
 class InitTests(unittest.TestCase):

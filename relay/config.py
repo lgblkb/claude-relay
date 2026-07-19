@@ -87,6 +87,10 @@ class Config:
     # start_margin. See `resolve_seat_ceiling()` for the full per-seat precedence.
     ceiling_pct: float = 70.0
     start_margin: float = 5.0
+    # When `claude-relay init`/`adopt` runs, whether to turn a bare ~/.claude login into a named
+    # seat (~/.claude-default): "always" (default) adopts it whenever ~/.claude has a login and
+    # the seat doesn't exist yet; "if-empty" only when no other named seats exist; "never" skips.
+    adopt_default: str = "always"
 
     # [seats.<name>] — per-seat ceiling override / pool exclusion.
     seat_configs: dict[str, SeatConfig] = dataclasses.field(default_factory=dict)
@@ -187,6 +191,9 @@ def load_config(
             cfg.ceiling_pct = float(defaults["ceiling_pct"])
         if "start_margin" in defaults:
             cfg.start_margin = float(defaults["start_margin"])
+        if "adopt_default" in defaults:
+            mode = str(defaults["adopt_default"]).strip().lower()
+            cfg.adopt_default = mode if mode in ("always", "if-empty", "never") else "always"
 
     seats_raw = raw.get("seats") or {}
     if isinstance(seats_raw, dict):

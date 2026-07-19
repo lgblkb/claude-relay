@@ -66,6 +66,19 @@ class _FakeCache:
 
 
 class PickSeatTests(unittest.TestCase):
+    def test_disabled_seat_is_skipped_and_not_polled(self) -> None:
+        good = _seat("good")
+        off = _seat("off")
+        # 'off' has the LOWER percent, so it would win if eligible — but it's disabled.
+        cache = _FakeCache({str(good.path): _usage_at(30.0), str(off.path): _usage_at(5.0)})
+        state = _state()
+        cooldown.set_seat_disabled(state, "off", True)
+        seat, _usage, notes = loop.pick_seat([off, good], state, cache, Config())
+        self.assertIsNotNone(seat)
+        self.assertEqual(seat.name, "good")
+        self.assertNotIn(str(off.path), cache.polled)  # disabled -> skipped before any network poll
+        self.assertIn("disabled: off", notes)
+
     def test_prefers_lowest_percent_under_start_cap(self) -> None:
         low = _seat("low")
         high = _seat("high")

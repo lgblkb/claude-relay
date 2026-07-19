@@ -223,8 +223,12 @@ def pick_seat(
     Claude's real 100%, and resolved per-seat so different seats can carry different ceilings.
     """
     notes: list[str] = []
+    disabled = cooldown.disabled_seats(state)
     candidates: list[tuple[fleet.Seat, usage_mod.UsageSnapshot]] = []
     for seat in seats:
+        if seat.name in disabled:
+            notes.append(f"disabled: {seat.name}")
+            continue
         if not seat.usable:
             notes.append(f"needs-login: {seat.name}")
             continue
@@ -405,6 +409,7 @@ def status_report(config: Config, state: dict[str, Any]) -> dict[str, Any]:
     `status` itself never mutates the repo).
     """
     seats = fleet.discover_seats(config.effective_exclude())
+    disabled = cooldown.disabled_seats(state)
     seat_rows = []
     for seat in seats:
         entry = cooldown.get_seat_state(state, seat.path)
@@ -414,6 +419,7 @@ def status_report(config: Config, state: dict[str, Any]) -> dict[str, Any]:
                 "path": str(seat.path),
                 "usable": seat.usable,
                 "needs_login": seat.needs_login,
+                "disabled": seat.name in disabled,
                 "cooldownUntil": entry.get("cooldownUntil"),
                 "lastPercent": entry.get("lastPercent"),
                 "lastSeenAt": entry.get("lastSeenAt"),

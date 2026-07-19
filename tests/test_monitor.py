@@ -117,6 +117,16 @@ class BuildSeatRowsTests(unittest.TestCase):
         self.assertEqual(row.source, "stale")  # a real last-known % beats a bare "auth" flag
         self.assertEqual(row.percent, 43.0)
 
+    def test_disabled_seat_is_labeled_disabled(self) -> None:
+        seat = _seat("almas")
+        state = cooldown.load_state(Path("/none"))
+        cooldown.set_seat_disabled(state, "almas", True)
+        # even a live-pollable seat shows "disabled" (still displays its %, just out of rotation)
+        cache = _FakeCache({str(seat.path): _usage(28.0)})
+        (row,) = self._rows([seat], cache, state)
+        self.assertEqual(row.state_label, "disabled")
+        self.assertEqual(row.source, "live")
+
     def test_cooling_seat_is_labeled_with_remaining_time(self) -> None:
         seat = _seat("sam")
         state = cooldown.load_state(Path("/none"))

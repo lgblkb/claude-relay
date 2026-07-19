@@ -1,4 +1,5 @@
-"""claude-relay CLI. Subcommands: run, status, login-check, resolve, seats, monitor, init.
+"""claude-relay CLI. Subcommands: run, status, login-check, init, adopt, disable, enable,
+resolve, seats, monitor.
 
 This module is the console entry point declared in pyproject.toml
 (`claude-relay = "relay.cli:main"`), so a `pip`/`pipx`/`uv tool` install exposes it as the
@@ -9,12 +10,16 @@ This module is the console entry point declared in pyproject.toml
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
+import shutil
 import sys
 from pathlib import Path
 
 from relay import config as config_mod
 from relay import cooldown, fleet, gadkit, loop, monitor
+
+DEFAULT_ADOPT_NAME = "default"
 
 # Minimal starter config written by `claude-relay init` (for pipx/uv installs that never run
 # install.sh). The fully-documented reference lives in config.example.toml in the repo; this is
@@ -33,6 +38,10 @@ exclude = ["yerasyl"]
 [defaults]
 # Synthetic per-seat rotation ceiling — deliberately LOWER than Claude's real 100% usage cap.
 ceiling_pct = 70
+# On `init`/`adopt`, turn a bare ~/.claude login into a named seat (~/.claude-default):
+#   "always" (default) | "if-empty" (only when no other seats) | "never".
+# Switch any seat off/on at runtime with `claude-relay disable <name>` / `enable <name>`.
+adopt_default = "always"
 
 [telegram]
 # notify-out + resolve-in channel. Secrets may instead come from the
@@ -40,6 +49,78 @@ ceiling_pct = 70
 bot_token = ""
 chat_id = ""
 """
+
+
+@dataclasses.dataclass(frozen=True)
+class AdoptResult:
+    status: str  # "adopted" | "exists" | "no-source" | "skipped"
+    name: str
+    seat_dir: Path
+
+
+def _adopt_default_seat(name: str, *, home: Path | None = None, force: bool = False) -> AdoptResult:
+    """Turn the bare ~/.claude login into a named seat ~/.claude-<name> by copying its
+    credentials into a fresh, private (0700/0600) config dir. Never touches ~/.claude itself.
+    Idempotent: returns "exists" (no write) if the seat already has credentials, unless `force`.
+    Copying just `.credentials.json` is enough to authenticate; Claude Code initializes the rest
+    of that config dir on first run. (The file is copied, never read/echoed.)
+    """
+    home = home or Path.home()
+    src = home / ".claude" / ".credentials.json"
+    seat_dir = home / f".claude-{name}"
+    dst = seat_dir / ".credentials.json"
+    if not src.is_file():
+        return AdoptResult("no-source", name, seat_dir)
+    if dst.exists() and not force:
+        return AdoptResult("exists", name, seat_dir)
+    seat_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        seat_dir.chmod(0o700)
+    except OSError:  # pragma: no cover - best-effort on exotic filesystems
+        pass
+    shutil.copy2(src, dst)
+    try:
+        dst.chmod(0o600)
+    except OSError:  # pragma: no cover
+        pass
+    return AdoptResult("adopted", name, seat_dir)
+
+
+def _maybe_adopt(
+    cfg: config_mod.Config, *, name: str, no_adopt: bool, force: bool = False, home: Path | None = None
+) -> AdoptResult:
+    """Run adoption according to `[defaults].adopt_default` (unless `--no-adopt`): "never" skips;
+    "if-empty" adopts only when no usable named seat exists yet; "always" adopts whenever
+    ~/.claude has a login and the target seat isn't there already.
+    """
+    if no_adopt or cfg.adopt_default == "never":
+        return AdoptResult("skipped", name, (home or Path.home()) / f".claude-{name}")
+    home = home or Path.home()
+    if cfg.adopt_default == "if-empty":
+        usable = [s for s in fleet.discover_seats(cfg.effective_exclude(), home=home) if s.usable]
+        if usable:
+            return AdoptResult("skipped", name, home / f".claude-{name}")
+    return _adopt_default_seat(name, home=home, force=force)
+
+
+def _report_adopt(res: AdoptResult, *, verbose: bool) -> None:
+    """Print the outcome of an adoption. `init` stays quiet on no-op/skip (verbose=False); the
+    explicit `adopt` command reports every outcome (verbose=True).
+    """
+    if res.status == "adopted":
+        print(
+            f"adopted your ~/.claude login as seat {res.name!r} -> {res.seat_dir}\n"
+            f"  (shares one account/quota with ~/.claude; "
+            f"turn it off with `claude-relay disable {res.name}`, undo with `rm -rf {res.seat_dir}`)"
+        )
+    elif not verbose:
+        return
+    elif res.status == "exists":
+        print(f"seat {res.name!r} already exists at {res.seat_dir} (use --force to re-copy credentials)")
+    elif res.status == "no-source":
+        print("nothing to adopt: no ~/.claude/.credentials.json (log in with `claude` first)")
+    elif res.status == "skipped":
+        print(f"adoption skipped (adopt_default policy or --no-adopt); no changes to {res.seat_dir}")
 
 
 def _parse_ceiling_overrides(raw: list[str] | None) -> dict[str, float]:
@@ -113,9 +194,15 @@ def cmd_login_check(args: argparse.Namespace) -> int:
     if not seats:
         print("no seats discovered (looked for ~/.claude-* directories with .credentials.json)")
         return 1
+    disabled = cooldown.disabled_seats(cooldown.load_state(cfg.state_path))
     exit_code = 0
     for seat in seats:
-        status = "usable" if seat.usable else "needs-login"
+        if seat.name in disabled:
+            status = "disabled"  # off by operator; still a real login, just out of rotation
+        elif seat.usable:
+            status = "usable"
+        else:
+            status = "needs-login"
         if seat.needs_login:
             exit_code = 1
         print(f"{status:12s} {seat.name:20s} {seat.path}")
@@ -141,27 +228,64 @@ def cmd_resolve(args: argparse.Namespace) -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    """Create ~/.claude-relay/ (config + logs) for a fresh install. Safe to re-run: it never
-    overwrites an existing config.toml unless --force is given. Mainly for pipx/uv installs,
+    """Create ~/.claude-relay/ (config + logs) for a fresh install AND adopt a bare ~/.claude
+    login into a named seat (per [defaults].adopt_default). Safe to re-run: never overwrites an
+    existing config.toml unless --force, and adoption is idempotent. Mainly for pipx/uv installs,
     which don't run install.sh; the clone flow's install.sh seeds the richer config.example.toml.
     """
     config_path = _config_path_arg(args) or config_mod.default_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_mod.default_log_dir().mkdir(parents=True, exist_ok=True)
+
     if config_path.exists() and not args.force:
-        print(f"config already exists: {config_path} (use --force to overwrite)")
-        return 0
-    config_path.write_text(_DEFAULT_CONFIG, encoding="utf-8")
-    try:
-        config_path.chmod(0o600)
-    except OSError:  # pragma: no cover - best-effort on exotic filesystems
-        pass
+        print(f"config already exists: {config_path} (left as-is; --force to overwrite)")
+    else:
+        config_path.write_text(_DEFAULT_CONFIG, encoding="utf-8")
+        try:
+            config_path.chmod(0o600)
+        except OSError:  # pragma: no cover - best-effort on exotic filesystems
+            pass
+        print(f"wrote {config_path}")
+
+    cfg = _load_config(args)
+    _report_adopt(_maybe_adopt(cfg, name=args.adopt_name, no_adopt=args.no_adopt), verbose=False)
+
     print(
-        f"wrote {config_path}\n"
         "edit `repo` and [telegram] (or set CLAUDE_RELAY_TELEGRAM_* env vars), "
         "then run `claude-relay login-check`."
     )
     return 0
+
+
+def cmd_adopt(args: argparse.Namespace) -> int:
+    """Explicitly turn the bare ~/.claude login into a named seat (ignores adopt_default policy —
+    if you asked, you get it). Idempotent unless --force."""
+    res = _adopt_default_seat(args.name, force=args.force)
+    _report_adopt(res, verbose=True)
+    return 0 if res.status in ("adopted", "exists") else 1
+
+
+def _toggle_seat(args: argparse.Namespace, *, disable: bool) -> int:
+    cfg = _load_config(args)
+    state = cooldown.load_state(cfg.state_path)
+    changed = cooldown.set_seat_disabled(state, args.seat, disable)
+    cooldown.save_state(cfg.state_path, state)
+    verb = "disabled" if disable else "enabled"
+    print(f"seat {args.seat!r} {verb}." if changed else f"seat {args.seat!r} was already {verb}.")
+    known = {s.name for s in fleet.discover_seats(cfg.effective_exclude())}
+    if args.seat not in known:
+        print(f"  note: no seat named {args.seat!r} discovered yet — setting saved, applies if it appears.")
+    return 0
+
+
+def cmd_disable(args: argparse.Namespace) -> int:
+    """Keep a seat out of rotation (pick_seat skips it); it still shows in `seats`/`login-check`."""
+    return _toggle_seat(args, disable=True)
+
+
+def cmd_enable(args: argparse.Namespace) -> int:
+    """Put a previously-disabled seat back into rotation."""
+    return _toggle_seat(args, disable=False)
 
 
 def _config_path_arg(args: argparse.Namespace) -> Path | None:
@@ -243,9 +367,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_login = sub.add_parser("login-check", help="list discovered seats and their login state")
     p_login.set_defaults(func=cmd_login_check)
 
-    p_init = sub.add_parser("init", help="create ~/.claude-relay/ (config + logs) for a fresh install")
+    p_init = sub.add_parser("init", help="create ~/.claude-relay/ + adopt ~/.claude into a seat")
     p_init.add_argument("--force", action="store_true", help="overwrite an existing config.toml")
+    p_init.add_argument("--no-adopt", action="store_true", help="skip adopting ~/.claude into a named seat")
+    p_init.add_argument(
+        "--adopt-name", default=DEFAULT_ADOPT_NAME,
+        help=f"name for the adopted seat (default: {DEFAULT_ADOPT_NAME})",
+    )
     p_init.set_defaults(func=cmd_init)
+
+    p_adopt = sub.add_parser("adopt", help="turn the bare ~/.claude login into a named seat")
+    p_adopt.add_argument(
+        "--name", default=DEFAULT_ADOPT_NAME, help=f"seat name (default: {DEFAULT_ADOPT_NAME})"
+    )
+    p_adopt.add_argument("--force", action="store_true", help="re-copy credentials even if the seat exists")
+    p_adopt.set_defaults(func=cmd_adopt)
+
+    p_disable = sub.add_parser("disable", help="keep a seat out of rotation (still shown in the fleet)")
+    p_disable.add_argument("seat", help="seat name (the ~/.claude-<name> suffix)")
+    p_disable.set_defaults(func=cmd_disable)
+
+    p_enable = sub.add_parser("enable", help="put a previously-disabled seat back into rotation")
+    p_enable.add_argument("seat", help="seat name (the ~/.claude-<name> suffix)")
+    p_enable.set_defaults(func=cmd_enable)
 
     p_resolve = sub.add_parser("resolve", help="mark an ownerDecision resolved in generations-index.json")
     p_resolve.add_argument("decision_id")

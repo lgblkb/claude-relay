@@ -42,6 +42,16 @@ ceiling_pct = 70
 # pick_seat() only STARTS a new unit on a seat whose percent is below `ceiling_pct -
 # start_margin` (it may still finish a unit already running closer to the ceiling).
 start_margin = 5
+# On `claude-relay init` / `adopt`, whether to turn a bare ~/.claude login into a named seat
+# (~/.claude-default) so the tool works out of the box on any machine:
+#   "always"   (default) adopt whenever ~/.claude has a login and the seat isn't there yet
+#   "if-empty" adopt only when NO other named seat exists
+#   "never"    never adopt automatically (use `claude-relay adopt` by hand if you want it)
+# The adopted seat shares one account/quota with ~/.claude. Switch ANY seat off/on at runtime
+# (no file edits) with `claude-relay disable <name>` / `claude-relay enable <name>` — a disabled
+# seat still shows in `seats`/`login-check` but is skipped by rotation. That is distinct from the
+# top-level `exclude` above (which hides a directory entirely) and from `main = true` below.
+adopt_default = "always"
 
 # Per-seat overrides — one [seats.<name>] table per seat you want to special-case. `<name>` is
 # the suffix after "~/.claude-" (e.g. "~/.claude-sam" -> "sam").

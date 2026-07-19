@@ -75,7 +75,28 @@ every `~/.claude-*` directory, minus:
 - any name in `exclude` (default `["yerasyl"]`).
 
 `claude-relay login-check` lists every discovered seat and whether it currently has a usable
-access token.
+access token (or is `disabled`, see below).
+
+### Adopting your main account
+
+The bare `~/.claude` is excluded for a *layout* reason, not because that account is off-limits:
+a normal seat keeps its `.credentials.json` **and** `.claude.json` in one dir, but the default
+profile's `.claude.json` sits at `~/.claude.json` (one level up), so `CLAUDE_CONFIG_DIR=~/.claude`
+gives a degraded session. So on a fresh machine with only the main login, `init`/`adopt`
+**adopts** it — copies `~/.claude/.credentials.json` into a proper named seat `~/.claude-default`
+(0700 dir / 0600 file; `~/.claude` is never touched). After that your main account is a
+first-class, rotatable seat. This runs automatically on install; tune it with
+`[defaults].adopt_default = "always" | "if-empty" | "never"` or `init --no-adopt`, and re-run by
+hand any time with `claude-relay adopt`. The adopted seat shares one account/quota with
+`~/.claude`, and with a single account there's no failover — bump `ceiling_pct` toward ~95 and
+add more accounts for real rotation.
+
+### Enabling / disabling seats
+
+`claude-relay disable <name>` keeps a seat **out of rotation** without deleting anything — it
+still appears in `seats`/`login-check` (marked `disabled`), but `pick_seat` skips it; re-enable
+with `claude-relay enable <name>`. This is a one-command runtime toggle stored in `state.json`,
+distinct from the static config `exclude` (which hides a dir entirely) and `main = true`.
 
 ### Synthetic per-seat rotation ceiling
 
@@ -94,9 +115,12 @@ literal exhaustion is correctly classified as having hit its wall (rotate), not 
 claude-relay run <repo> --dry-run   # prints the triage Plan + chosen seat + exact argv; spawns nothing
 claude-relay run <repo> --once      # one triage/run/classify iteration, then exit
 claude-relay run <repo>             # the full rotation loop (blocks; Ctrl-C to stop)
-claude-relay init                   # seed ~/.claude-relay/ (config + logs); for pipx/uv installs
+claude-relay init                   # seed ~/.claude-relay/ + adopt ~/.claude into a seat
+claude-relay adopt [--name default] # (re)adopt the bare ~/.claude login as a named seat
+claude-relay disable <seat>         # keep a seat OUT of rotation (still shown in the fleet)
+claude-relay enable  <seat>         # put a disabled seat back into rotation
 claude-relay status                 # offline seat + triage snapshot as JSON
-claude-relay login-check            # list seats + login state
+claude-relay login-check            # list seats + login state (marks disabled seats)
 claude-relay resolve <id> <answer>  # durably resolve an ownerDecision (unblocks AWAITING_HUMAN)
 claude-relay seats                  # print the live+fallback all-seats usage table once (great over SSH)
 claude-relay seats --watch [SECS]   # ...refreshing in place every SECS (default 60)

@@ -13,6 +13,7 @@ Schema (schemaVersion 1):
         }
       },
       "lastNotified": {"all-exhausted": "...", "needs-login:<dir>": "..."},
+      "disabledSeats": ["<seatName>", ...],
       "telegramUpdateOffset": 0,
       "repos": {
         "<repoPath>": {
@@ -24,7 +25,12 @@ Schema (schemaVersion 1):
 
 `telegramUpdateOffset` is an additive field beyond DESIGN.md's literal §6 example — it is the
 Telegram long-poll cursor the resolve-in poller needs to avoid re-processing old updates
-(notify.py). `repos` is also additive: `cleanBaselineHead` is the last git HEAD claude-relay
+(notify.py). `disabledSeats` (also additive) is the operator's dynamic on/off switch, keyed by
+seat NAME (`~/.claude-<name>` suffix): a disabled seat still appears in the fleet (`seats` /
+`login-check`) but `pick_seat()` skips it. It lives here (runtime state), NOT config.toml,
+because claude-relay is stdlib-only and cannot cleanly rewrite TOML — so `disable`/`enable` are
+one-command JSON edits. It is distinct from config `exclude`, which hides a dir entirely.
+`repos` is also additive: `cleanBaselineHead` is the last git HEAD claude-relay
 itself observed this repo clean at (Invariant #6/#7 — a dirty tree is only ever attributed to
 claude-relay's own in-flight run when HEAD hasn't moved since that baseline; otherwise triage()
 refuses with AWAITING_HUMAN rather than guessing). `lastStash` records the most recent
@@ -51,6 +57,7 @@ def _empty_state() -> dict[str, Any]:
         "schemaVersion": SCHEMA_VERSION,
         "seats": {},
         "lastNotified": {},
+        "disabledSeats": [],
         "telegramUpdateOffset": 0,
         "repos": {},
     }
@@ -73,6 +80,7 @@ def load_state(state_path: Path) -> dict[str, Any]:
     data.setdefault("schemaVersion", SCHEMA_VERSION)
     data.setdefault("seats", {})
     data.setdefault("lastNotified", {})
+    data.setdefault("disabledSeats", [])
     data.setdefault("telegramUpdateOffset", 0)
     data.setdefault("repos", {})
     return data
@@ -150,6 +158,30 @@ def update_seat(
         entry["consecutiveFailures"] = consecutive_failures
     if note != "__unset__":
         entry["note"] = note
+
+
+def disabled_seats(state: dict[str, Any]) -> set[str]:
+    """Seat NAMES the operator has switched off via `claude-relay disable` — still shown in the
+    fleet but skipped by pick_seat(). Keyed by name (the `~/.claude-<name>` suffix), which is
+    what both the CLI and pick_seat() work in. Distinct from config `exclude` (which hides a
+    directory entirely).
+    """
+    raw = state.get("disabledSeats") or []
+    return {str(x) for x in raw}
+
+
+def set_seat_disabled(state: dict[str, Any], name: str, disabled: bool) -> bool:
+    """Add/remove `name` from the disabled set, keeping it sorted. Returns True if the set
+    actually changed, so the CLI can distinguish a real toggle from a no-op ("already disabled").
+    """
+    current = disabled_seats(state)
+    changed = (name in current) != disabled
+    if disabled:
+        current.add(name)
+    else:
+        current.discard(name)
+    state["disabledSeats"] = sorted(current)
+    return changed
 
 
 def is_in_cooldown(state: dict[str, Any], seat_dir: Path | str, now: dt.datetime | None = None) -> bool:
