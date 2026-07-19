@@ -25,15 +25,44 @@ doesn't show.
 
 ## Install
 
+claude-relay is stdlib-only (no third-party dependencies), so any of these works on a fresh
+machine. Pick one:
+
+**With [uv](https://docs.astral.sh/uv/) (recommended):**
+
 ```bash
-./install.sh
+uv tool install git+https://github.com/lgblkb/claude-relay
+claude-relay init          # seed ~/.claude-relay/config.toml (+ logs dir)
 ```
 
-This symlinks `bin/claude-relay` into `~/.local/bin/claude-relay`, writes
-`~/.claude-relay/config.toml` from `config.example.toml` if one doesn't exist yet, and runs
-`verify.sh`. Edit `~/.claude-relay/config.toml` — at minimum set `repo` and, if you want
+**With [pipx](https://pipx.pypa.io/):**
+
+```bash
+pipx install git+https://github.com/lgblkb/claude-relay
+claude-relay init
+```
+
+**One-liner** (auto-detects uv → pipx → git clone; seeds the config for you):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lgblkb/claude-relay/main/install.sh | bash
+```
+
+**From a clone** (for hacking on it — runs in place, no build step):
+
+```bash
+git clone https://github.com/lgblkb/claude-relay && cd claude-relay
+./install.sh               # symlinks bin/claude-relay into ~/.local/bin, seeds config, runs verify.sh
+```
+
+After installing, edit `~/.claude-relay/config.toml` — at minimum set `repo` and, if you want
 Telegram notifications/resolve-in, `[telegram].bot_token` / `chat_id` (or the
-`CLAUDE_RELAY_TELEGRAM_BOT_TOKEN` / `CLAUDE_RELAY_TELEGRAM_CHAT_ID` environment variables).
+`CLAUDE_RELAY_TELEGRAM_BOT_TOKEN` / `CLAUDE_RELAY_TELEGRAM_CHAT_ID` environment variables) —
+then sanity-check the fleet with `claude-relay login-check`. Make sure `~/.local/bin` is on your
+`PATH`.
+
+**Update / uninstall:** `uv tool upgrade claude-relay` / `pipx upgrade claude-relay` (or re-run
+the one-liner); `uv tool uninstall claude-relay` / `pipx uninstall claude-relay`.
 
 ## Seats
 
@@ -65,6 +94,7 @@ literal exhaustion is correctly classified as having hit its wall (rotate), not 
 claude-relay run <repo> --dry-run   # prints the triage Plan + chosen seat + exact argv; spawns nothing
 claude-relay run <repo> --once      # one triage/run/classify iteration, then exit
 claude-relay run <repo>             # the full rotation loop (blocks; Ctrl-C to stop)
+claude-relay init                   # seed ~/.claude-relay/ (config + logs); for pipx/uv installs
 claude-relay status                 # offline seat + triage snapshot as JSON
 claude-relay login-check            # list seats + login state
 claude-relay resolve <id> <answer>  # durably resolve an ownerDecision (unblocks AWAITING_HUMAN)

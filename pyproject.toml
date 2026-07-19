@@ -1,9 +1,41 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "claude-relay"
 version = "0.1.0"
 description = "Stdlib-only supervisor that rotates a headless Claude Code workload across seats as each account's 5-hour usage window fills up."
+readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Dias Bakhtiyarov" }]
+keywords = ["claude", "claude-code", "gad-kit", "supervisor", "rotation", "headless"]
 dependencies = []
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Build Tools",
+  "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/lgblkb/claude-relay"
+Repository = "https://github.com/lgblkb/claude-relay"
+Issues = "https://github.com/lgblkb/claude-relay/issues"
+
+[project.scripts]
+claude-relay = "relay.cli:main"
+
+[tool.setuptools]
+packages = ["relay"]
 
 [tool.ruff]
 line-length = 110

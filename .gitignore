@@ -4,6 +4,10 @@ __pycache__/
 .mypy_cache/
 *.egg-info/
 
+# Python packaging build artifacts (from `uv build` / `pip install .` / `python -m build`).
+build/
+dist/
+
 # Secrets & runtime state — NEVER commit. The real config (with the Telegram bot token)
 # lives at ~/.claude-relay/config.toml, outside this repo; config.example.toml is the
 # secret-free template. These patterns are a defensive backstop against an accidental drop.
