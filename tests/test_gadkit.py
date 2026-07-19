@@ -511,5 +511,55 @@ class ResolveOwnerDecisionTests(unittest.TestCase):
         self.assertFalse(result.found)
 
 
+class OpenDecisionsAndFormatTests(unittest.TestCase):
+    """The back-channel self-documenting helpers: which decisions are resolvable, and rendering
+    them so the operator is told the exact `resolve <id> <answer>` line."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name) / "repo"
+        self.addCleanup(self._tmp.cleanup)
+        _init_repo(self.repo)
+
+    def test_open_owner_decisions_returns_only_open_across_nesting(self) -> None:
+        _write_index(
+            self.repo,
+            {
+                "project": "t",
+                "nextGen": 1,
+                "generations": [
+                    {
+                        "gen": 0,
+                        "ownerDecisions": [
+                            {"id": "D1", "question": "q1", "status": "open"},
+                            {"id": "D2", "question": "q2", "status": "resolved"},
+                        ],
+                    }
+                ],
+            },
+        )
+        self.assertEqual([d["id"] for d in gadkit.open_owner_decisions(self.repo)], ["D1"])
+
+    def test_open_owner_decisions_empty_when_no_index(self) -> None:
+        self.assertEqual(gadkit.open_owner_decisions(self.repo), [])
+
+    def test_format_includes_question_and_exact_reply_line(self) -> None:
+        block = gadkit.format_decisions_for_operator(
+            [{"id": "G0-2", "question": "Add packaging?", "status": "open"}], gen=1
+        )
+        self.assertIn("gen 1", block)
+        self.assertIn("G0-2", block)
+        self.assertIn("Add packaging?", block)
+        self.assertIn("resolve G0-2 <your answer>", block)
+
+    def test_format_empty_list_is_empty_string(self) -> None:
+        self.assertEqual(gadkit.format_decisions_for_operator([]), "")
+
+    def test_format_truncates_a_very_long_question(self) -> None:
+        block = gadkit.format_decisions_for_operator([{"id": "D1", "question": "x" * 500}])
+        self.assertIn("...", block)
+        self.assertLess(len(block), 300)
+
+
 if __name__ == "__main__":
     unittest.main()

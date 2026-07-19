@@ -7,6 +7,7 @@ branch (genuinely offline) or `send_telegram`/`get_updates` themselves mocked ou
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from relay import cooldown, notify
@@ -14,9 +15,11 @@ from relay.config import Config
 
 
 def _state() -> dict:
-    from pathlib import Path
-
     return cooldown.load_state(Path("/nonexistent-claude-relay-state.json"))
+
+
+def _update(update_id: int, text: str, chat_id: str = "123") -> dict:
+    return {"update_id": update_id, "message": {"text": text, "chat": {"id": chat_id}}}
 
 
 class RedactTests(unittest.TestCase):
@@ -135,6 +138,56 @@ class NotifyDedupeTests(unittest.TestCase):
         self.assertTrue(notify.notify(cfg, state, key_d1, "gated on D1"))
         self.assertTrue(notify.notify(cfg, state, key_d2, "gated on D2"))  # different key -> sends
         self.assertFalse(notify.notify(cfg, state, key_d1, "gated on D1 again"))  # same key -> deduped
+
+
+class PollTelegramUpdatesTests(unittest.TestCase):
+    """The resolve-in poller: status reply, the new help fallback (+ its once-per-batch dedupe),
+    and chat-id gating. get_updates/send_telegram are mocked — no network. A nonexistent repo is
+    fine: open_owner_decisions() returns [] so help degrades to 'No open decisions right now.'"""
+
+    def _cfg(self) -> Config:
+        return Config(notify_sink="telegram", telegram_bot_token="tok", telegram_chat_id="123")
+
+    def test_status_message_replies_with_status_provider(self) -> None:
+        cfg, state = self._cfg(), _state()
+        with mock.patch.object(notify, "get_updates", return_value=[_update(10, "status")]), \
+             mock.patch.object(notify, "send_telegram", return_value=True) as sent:
+            out = notify.poll_telegram_updates(cfg, state, Path("/no/repo"), status_provider=lambda: "STATUS-OK")
+        self.assertEqual(out, ["status"])
+        sent.assert_called_once()
+        self.assertEqual(sent.call_args.args[2], "STATUS-OK")
+        self.assertEqual(cooldown.get_telegram_offset(state), 11)  # advanced past update 10
+
+    def test_unrecognized_message_replies_with_help(self) -> None:
+        cfg, state = self._cfg(), _state()
+        with mock.patch.object(notify, "get_updates", return_value=[_update(5, "hello there")]), \
+             mock.patch.object(notify, "send_telegram", return_value=True) as sent:
+            out = notify.poll_telegram_updates(cfg, state, Path("/no/repo"))
+        self.assertIn("help", out)
+        sent.assert_called_once()
+        help_msg = sent.call_args.args[2]
+        self.assertIn("resolve <id> <answer>", help_msg)
+        self.assertIn("status", help_msg)
+
+    def test_help_is_sent_at_most_once_per_batch(self) -> None:
+        cfg, state = self._cfg(), _state()
+        updates = [_update(1, "hi"), _update(2, "what can you do"), _update(3, "??")]
+        with mock.patch.object(notify, "get_updates", return_value=updates), \
+             mock.patch.object(notify, "send_telegram", return_value=True) as sent:
+            out = notify.poll_telegram_updates(cfg, state, Path("/no/repo"))
+        self.assertEqual(out.count("help"), 1)  # one help for the whole flurry
+        sent.assert_called_once()
+        self.assertEqual(cooldown.get_telegram_offset(state), 4)  # still advanced past all three
+
+    def test_message_from_other_chat_is_ignored_but_offset_advances(self) -> None:
+        cfg, state = self._cfg(), _state()
+        updates = [_update(7, "status", chat_id="999"), _update(8, "hello", chat_id="999")]
+        with mock.patch.object(notify, "get_updates", return_value=updates), \
+             mock.patch.object(notify, "send_telegram", return_value=True) as sent:
+            out = notify.poll_telegram_updates(cfg, state, Path("/no/repo"))
+        self.assertEqual(out, [])
+        sent.assert_not_called()
+        self.assertEqual(cooldown.get_telegram_offset(state), 9)  # don't re-fetch ignored messages
 
 
 if __name__ == "__main__":

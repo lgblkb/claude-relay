@@ -475,6 +475,21 @@ def _park_notify_key(repo: Path, plan: gadkit.Plan) -> str:
     return f"park:{repo}:{plan.kind}:{plan.gen}:{distinguishing}"
 
 
+def _park_message(repo: Path, plan: gadkit.Plan) -> str:
+    """The human-facing park notification. For a gated-owner-decision park, spell out each
+    decision's QUESTION and the exact `resolve <id> <answer>` line to reply — so the operator
+    reacts to a complete prompt instead of just an id list they'd have to look up (matches the
+    Telegram help fallback). Falls back to the concise `kind: detail` for handoff/other parks.
+    """
+    if plan.blocking_decision_ids:
+        ids = set(plan.blocking_decision_ids)
+        decisions = [d for d in gadkit.open_owner_decisions(repo) if str(d.get("id")) in ids]
+        block = gadkit.format_decisions_for_operator(decisions, gen=plan.gen)
+        if block:
+            return f"claude-relay parked {repo.name} — needs your decision.\n{block}"
+    return f"{plan.kind}: {plan.detail}"
+
+
 def run(
     repo: Path,
     config: Config,
@@ -580,7 +595,7 @@ def run(
 
                 if kind == detector.NOTIFY_PARK:
                     key = _park_notify_key(repo, iteration.plan)
-                    notify.notify(config, state, key, f"{iteration.plan.kind}: {iteration.plan.detail}")
+                    notify.notify(config, state, key, _park_message(repo, iteration.plan))
                     cooldown.save_state(config.state_path, state)
                     if once:
                         return 0

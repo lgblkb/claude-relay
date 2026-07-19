@@ -191,6 +191,38 @@ def blocking_decisions(decisions: list[dict[str, Any]], next_gen: int) -> list[d
     return blocking
 
 
+def open_owner_decisions(repo: Path) -> list[dict[str, Any]]:
+    """Every OPEN ownerDecision in the repo (gating or advisory), for the back-channel's
+    self-documenting help + park messages — so the operator sees which ids are resolvable and
+    what each one asks, instead of having to know them cold. Read-only; returns [] if the repo is
+    not GAD-bootstrapped or unreadable.
+    """
+    index = read_index(repo)
+    if index is None:
+        return []
+    return [d for d in find_owner_decisions(index) if d.get("status") == _OPEN_STATUS]
+
+
+def format_decisions_for_operator(decisions: list[dict[str, Any]], *, gen: int | None = None) -> str:
+    """Render owner decisions into a phone-friendly block that TELLS the operator exactly what to
+    send back — question text plus the literal `resolve <id> <answer>` line — so no command syntax
+    has to be memorized. Questions are truncated so a long decision can't blow up one Telegram
+    message. Returns '' for an empty list (callers decide the empty-state wording).
+    """
+    if not decisions:
+        return ""
+    header = f"Decision needed (gen {gen}):" if gen is not None else "Open decisions:"
+    lines = [header]
+    for d in decisions:
+        did = str(d.get("id", "?"))
+        question = str(d.get("question", "")).strip().replace("\n", " ")
+        if len(question) > 180:
+            question = question[:177] + "..."
+        lines.append(f"• {did}: {question}" if question else f"• {did}")
+        lines.append(f"  reply:  resolve {did} <your answer>")
+    return "\n".join(lines)
+
+
 def backlog_generations(repo: Path) -> list[int]:
     """Generation numbers declared in `.gad/backlog.md` (headers of the form `## G<N> — ...`)."""
     backlog_path = Path(repo) / ".gad" / "backlog.md"

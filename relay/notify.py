@@ -194,6 +194,24 @@ def notify(config: Config, state: dict[str, Any], key: str, message: str, *, for
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _help_text(repo: Path) -> str:
+    """Self-documenting reply to any unrecognized operator message: the command menu plus the
+    repo's current open decisions (id + question + the literal `resolve` line), so the operator
+    never has to know the syntax cold — sending anything at all surfaces exactly what to do.
+    """
+    from . import gadkit  # deferred (same reason as in poll_telegram_updates)
+
+    lines = [
+        "claude-relay — I understand two commands:",
+        "  • status — current seats + what I'm doing",
+        "  • resolve <id> <answer> — answer an open decision",
+        "",
+    ]
+    decisions = gadkit.open_owner_decisions(Path(repo))
+    lines.append(gadkit.format_decisions_for_operator(decisions) if decisions else "No open decisions right now.")
+    return "\n".join(lines)
+
+
 def poll_telegram_updates(
     config: Config,
     state: dict[str, Any],
@@ -221,6 +239,7 @@ def poll_telegram_updates(
     updates = get_updates(config.telegram_bot_token, offset=offset, timeout=timeout)
     processed: list[str] = []
     highest_seen = offset - 1
+    help_sent = False  # at most one help reply per batch, so a flurry of chatter can't spam
 
     for update in updates:
         update_id = update.get("update_id")
@@ -252,6 +271,14 @@ def poll_telegram_updates(
             send_telegram(config.telegram_bot_token, config.telegram_chat_id, status_text)
             processed.append("status")
             continue
+
+        # Anything else from the operator: reply with the self-documenting help menu (once per
+        # batch) instead of silently ignoring it — so an unrecognized message teaches the syntax
+        # + surfaces the open decisions, rather than leaving the operator guessing.
+        if not help_sent:
+            send_telegram(config.telegram_bot_token, config.telegram_chat_id, _help_text(Path(repo)))
+            processed.append("help")
+            help_sent = True
 
     if highest_seen >= offset:
         cooldown.set_telegram_offset(state, highest_seen + 1)
