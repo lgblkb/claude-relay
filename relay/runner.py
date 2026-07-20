@@ -27,8 +27,19 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import plugins
+
 DEFAULT_TAIL_LINES = 200
 DEFAULT_RUN_TIMEOUT_S = 7200.0
+
+
+def build_claude_argv(argv: list[str], plugin_dirs: list[str] | None = None) -> list[str]:
+    """The full process argv: `claude [--plugin-dir <root> ...] <argv...>`. The `--plugin-dir`
+    flags (resolved, absolute plugin roots) come FIRST so they apply to the whole session; they
+    are empty by default (gad-kit needs none — see plugins.py). Pure/side-effect-free so it can
+    be unit-tested and shown verbatim in `run --dry-run`.
+    """
+    return ["claude", *plugins.plugin_flags(plugin_dirs or []), *argv]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,6 +88,7 @@ def run(
     tail_lines: int = DEFAULT_TAIL_LINES,
     env: dict[str, str] | None = None,
     timeout_s: float | None = DEFAULT_RUN_TIMEOUT_S,
+    plugin_dirs: list[str] | None = None,
 ) -> RunResult:
     """Run `claude <argv...>` with cwd=`repo` and `CLAUDE_CONFIG_DIR=config_dir`. Blocks until
     the process exits OR `timeout_s` elapses (None disables the timeout — not recommended for
@@ -90,7 +102,7 @@ def run(
     deadline = start + timeout_s if timeout_s is not None else None
 
     process = subprocess.Popen(  # noqa: S603 - argv is built by gadkit.command(), not user shell input
-        ["claude", *argv],
+        build_claude_argv(argv, plugin_dirs),
         cwd=str(repo),
         env=_seat_env(env if env is not None else dict(os.environ), config_dir),
         stdout=subprocess.PIPE,

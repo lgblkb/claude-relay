@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 from relay import config as config_mod
-from relay import cooldown, fleet, gadkit, loop, monitor
+from relay import cooldown, fleet, gadkit, loop, monitor, share
 
 DEFAULT_ADOPT_NAME = "default"
 
@@ -288,6 +288,48 @@ def cmd_enable(args: argparse.Namespace) -> int:
     return _toggle_seat(args, disable=False)
 
 
+def cmd_share(args: argparse.Namespace) -> int:
+    """Symlink every seat's `projects/` to one canonical `~/.claude/projects` so all seats share
+    session history + memory (mirrors the multi-profile-shared-claude skill; compatible with it).
+    `--plugins` also shares the plugin cache/marketplaces; `--check` reports without changing
+    anything. Returns non-zero only if a real conflict was found (a symlink pointing elsewhere,
+    or a name collision left for manual review).
+    """
+    home = Path.home()
+    # ALL real seats — NOT the rotation-filtered set: you still want an `exclude`d/disabled seat's
+    # sessions shared. discover_seats already skips ~/.claude-relay and the bare ~/.claude.
+    seats = fleet.discover_seats(exclude=None, home=home)
+    if not seats:
+        print("No seats discovered (nothing under ~/.claude-* looks like a profile) — nothing to share.")
+        return 0
+
+    results = share.share_seats(
+        seats, home=home, check=bool(args.check), include_plugins=bool(args.plugins)
+    )
+    canon = share.canonical_dir(share.PROJECTS, home=home)
+    verb = "would change" if args.check else "state"
+    print(f"Sharing seats -> canonical {canon}  ({verb}):\n")
+    width = max((len(r.seat) for r in results), default=6)
+    for r in results:
+        print(f"  {r.seat:<{width}}  {r.subpath:<20}  {r.status:<11}  {r.detail}")
+
+    conflicts = [r for r in results if r.status in share.CONFLICT_STATUSES]
+    changed = [r for r in results if r.status in (share.LINKED, share.FOLDED)]
+    print()
+    if args.check:
+        pending = [r for r in results if r.status in (share.WOULD_LINK, share.WOULD_FOLD)]
+        print(
+            f"{len(pending)} link(s) pending, {len(conflicts)} conflict(s). "
+            "Re-run without --check to apply."
+        )
+    else:
+        print(f"{len(changed)} link(s) created/folded, {len(conflicts)} conflict(s) left for review.")
+    if conflicts:
+        print("Conflicts were left untouched (nothing was overwritten) — resolve them by hand.")
+        return 1
+    return 0
+
+
 def _config_path_arg(args: argparse.Namespace) -> Path | None:
     return Path(args.config).expanduser() if getattr(args, "config", None) else None
 
@@ -390,6 +432,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_enable = sub.add_parser("enable", help="put a previously-disabled seat back into rotation")
     p_enable.add_argument("seat", help="seat name (the ~/.claude-<name> suffix)")
     p_enable.set_defaults(func=cmd_enable)
+
+    p_share = sub.add_parser(
+        "share", help="share session history + memory across seats (symlink projects/ to a canonical store)"
+    )
+    p_share.add_argument(
+        "--check", action="store_true", help="report what would change without modifying anything"
+    )
+    p_share.add_argument(
+        "--plugins", action="store_true",
+        help="also share plugins/cache + plugins/marketplaces (full mirror, like the skill)",
+    )
+    p_share.set_defaults(func=cmd_share)
 
     p_resolve = sub.add_parser("resolve", help="mark an ownerDecision resolved in generations-index.json")
     p_resolve.add_argument("decision_id")

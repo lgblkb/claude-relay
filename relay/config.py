@@ -101,6 +101,12 @@ class Config:
     gadkit_tier: str = "budget"  # gad-kit calls this its --profile flag; see gadkit.py docstring
     gadkit_extra_flags: list[str] = dataclasses.field(default_factory=list)
 
+    # [plugins].dirs — OPT-IN plugin names/paths exposed to every headless run as `--plugin-dir`.
+    # Default empty: gad-kit needs NO per-seat plugin (it runs by absolute path + built-in tools).
+    # Name an entry only for a plugin you want available inside runs on every seat; `"*"` = all.
+    # See plugins.py for why blanket-loading behavioural plugins (e.g. context-mode) is a bad idea.
+    plugin_dirs: list[str] = dataclasses.field(default_factory=list)
+
     # [telegram]
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
@@ -212,6 +218,10 @@ def load_config(
             cfg.gadkit_tier = str(gadkit["tier"])
         if "extra_flags" in gadkit and isinstance(gadkit["extra_flags"], list):
             cfg.gadkit_extra_flags = [str(x) for x in gadkit["extra_flags"]]
+
+    plugins_raw = raw.get("plugins") or {}
+    if isinstance(plugins_raw, dict) and isinstance(plugins_raw.get("dirs"), list):
+        cfg.plugin_dirs = [str(x) for x in plugins_raw["dirs"]]
 
     telegram = raw.get("telegram") or {}
     if isinstance(telegram, dict):

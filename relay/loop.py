@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import cooldown, detector, fleet, gadkit, notify, runner
+from . import cooldown, detector, fleet, gadkit, notify, plugins, runner
 from . import usage as usage_mod
 from .config import Config
 
@@ -341,6 +341,7 @@ def run_once(
 
     pre = gadkit.snapshot(repo)
     argv = gadkit.command(plan)
+    plugin_dirs = [str(p) for p in plugins.resolve_plugin_dirs(config.plugin_dirs)]
     result = runner.run(
         argv,
         repo=repo,
@@ -348,6 +349,7 @@ def run_once(
         log_dir=config.log_dir,
         seat_name=seat.name,
         timeout_s=config.run_timeout_s,
+        plugin_dirs=plugin_dirs,
     )
 
     ceiling = config.resolve_seat_ceiling(seat.name)
@@ -392,7 +394,9 @@ def dry_run_preview(repo: Path, config: Config, state: dict[str, Any]) -> dict[s
         "detail": plan.detail,
     }
     if plan.kind in ("RUN", "FINISH"):
-        preview["argv"] = gadkit.command(plan)
+        resolved = [str(p) for p in plugins.resolve_plugin_dirs(config.plugin_dirs)]
+        preview["plugin_dirs"] = resolved
+        preview["argv"] = runner.build_claude_argv(gadkit.command(plan), resolved)[1:]  # drop "claude"
         seats = fleet.discover_seats(config.effective_exclude())
         cache = usage_mod.UsageCache()
         seat, seat_usage, notes = pick_seat(seats, copy.deepcopy(state), cache, config)

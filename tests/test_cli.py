@@ -27,6 +27,7 @@ class ParserTests(unittest.TestCase):
             ["adopt", "--name", "default", "--force"],
             ["disable", "sam"],
             ["enable", "sam"],
+            ["share", "--check", "--plugins"],
             ["resolve", "d1", "yes"],
             ["seats", "--watch", "30"],
             ["monitor", "/x"],

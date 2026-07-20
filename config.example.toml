@@ -71,6 +71,19 @@ tier = "budget"
 # /gad-finish prompt this tool builds (e.g. ["--milestone"] or ["--skip-premortem"]).
 extra_flags = []
 
+[plugins]
+# OPT-IN plugins exposed to EVERY headless run on EVERY seat, via `claude --plugin-dir <root>`.
+# Default [] — and gad-kit needs nothing here: claude-relay runs it by absolute path with only
+# built-in tools, so it already works on every seat regardless of per-seat plugin enablement.
+# Add a plugin ONLY if you want its skills/slash-commands/agents available INSIDE runs on every
+# seat. Each entry is a plugin NAME (resolved to the newest version under ~/.claude/plugins/cache,
+# e.g. "gad-kit") or an absolute path to a plugin root; "*" means every installed plugin.
+# CAUTION: think twice before adding a *behavioural* plugin like "context-mode" — its SessionStart
+# hook + MCP tools would load into every gad-kit coder/reviewer sub-agent, adding token cost and
+# eroding run-to-run determinism. Name only plugins that genuinely earn a place in a build run.
+# dirs = ["gad-kit"]
+dirs = []
+
 [telegram]
 # Recommended default notify-out sink + the resolve-in reply channel. Secrets may also come
 # from the CLAUDE_RELAY_TELEGRAM_BOT_TOKEN / CLAUDE_RELAY_TELEGRAM_CHAT_ID environment

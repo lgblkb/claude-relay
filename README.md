@@ -98,6 +98,41 @@ still appears in `seats`/`login-check` (marked `disabled`), but `pick_seat` skip
 with `claude-relay enable <name>`. This is a one-command runtime toggle stored in `state.json`,
 distinct from the static config `exclude` (which hides a dir entirely) and `main = true`.
 
+### Sharing session history & memory across seats
+
+Because `CLAUDE_CONFIG_DIR` relocates a seat's *entire* config dir, each `~/.claude-<name>` gets
+its own `projects/` — so by default seats do **not** share session history or memory. Rotation
+doesn't need them to (the workload resumes from the repo's `.gad/` on disk, never a `--resume`
+transcript), but if you want every seat to see the same history/memory — the way a laptop set up
+with the `multi-profile-shared-claude` skill does — run:
+
+```bash
+claude-relay share            # symlink every seat's projects/ -> canonical ~/.claude/projects
+claude-relay share --check    # report what would change, modify nothing
+claude-relay share --plugins  # ALSO share plugins/cache + plugins/marketplaces (full mirror)
+```
+
+It symlinks each seat's **whole** `projects/` dir (the `--resume` picker doesn't follow per-repo
+symlinks) to one canonical `~/.claude/projects`; memory rides along automatically because it lives
+at `projects/<repo-slug>/memory/`. It is **idempotent and compatible** with that skill — a seat
+already correctly linked is reported `ok` and left alone — and **safe**: it never touches
+`.credentials.json` / `settings.json` / `.claude.json` / `history.jsonl` (a seat is a distinct
+account), and a pre-existing real `projects/` is folded in *never-clobber* — a name collision is
+left in place and reported for you to resolve by hand, never overwritten.
+
+### Plugins in headless runs
+
+claude-relay runs gad-kit on **every** seat with **zero** per-seat plugin setup: it invokes the
+bundled workflow by absolute `scriptPath` and injects each role by absolute-path prompt, using only
+built-in tools — so installing gad-kit once in your main `~/.claude` covers every seat. If you *also*
+want some other plugin's skills / slash-commands / agents available inside runs on every seat, list
+it under `[plugins].dirs` (a name resolved from `~/.claude/plugins/cache`, an absolute plugin root,
+or `"*"` for all); claude-relay then passes `claude --plugin-dir <root>` on every run. Default is
+`[]` — deliberately. Blanket-loading a *behavioural* plugin (e.g. `context-mode`, whose SessionStart
+hook rewrites how an agent works) into gad-kit's tightly-choreographed coder/reviewer sub-agents adds
+token cost and erodes the run-to-run determinism a generational build depends on. Name only the
+plugins that genuinely earn a place.
+
 ### Synthetic per-seat rotation ceiling
 
 Rotation is gated on a **synthetic ceiling** — a percent deliberately LOWER than Claude's real
@@ -119,6 +154,7 @@ claude-relay init                   # seed ~/.claude-relay/ + adopt ~/.claude in
 claude-relay adopt [--name default] # (re)adopt the bare ~/.claude login as a named seat
 claude-relay disable <seat>         # keep a seat OUT of rotation (still shown in the fleet)
 claude-relay enable  <seat>         # put a disabled seat back into rotation
+claude-relay share [--check]        # share session history + memory across all seats (symlinks)
 claude-relay status                 # offline seat + triage snapshot as JSON
 claude-relay login-check            # list seats + login state (marks disabled seats)
 claude-relay resolve <id> <answer>  # durably resolve an ownerDecision (unblocks AWAITING_HUMAN)
