@@ -33,19 +33,33 @@ so the relay would rotate away from the seat long before a wall. The harness the
 `claude -p` directly with `CLAUDE_CONFIG_DIR` pointed at the chosen seat, which is also what
 refreshes that seat's OAuth token (DESIGN.md §0).
 
-PRE-REGISTERED QUESTIONS (fixed before looking at any result)
--------------------------------------------------------------
+PRE-REGISTERED QUESTIONS (fixed before looking at any result; answers appended, never edited)
+--------------------------------------------------------------------------------------------
   Q1  Does a five-hour wall emit a `rate_limit_event` AT ALL, or only a terminal `result` error?
       If the latter, `detector._rate_limit_event_action()` is decorative exactly when it matters
       and the stdout backstop is the real path. Highest-value question here.
+      -> OPEN. Needs a genuinely walled window.
   Q2  Which `status` values exist? `allowed_warning` is the only one ever observed.
+      -> PARTIAL (2026-07-27): `allowed` also exists. Its absence from
+         `detector._KNOWN_SAFE_RATE_LIMIT_STATUSES` was a live HIGH-severity bug — see that
+         constant's comment. No BLOCKING value observed yet, so the enum's far end is still open.
   Q3  Does `rateLimitType: "five_hour"` ever appear? Only `seven_day` has been seen — yet the
       five-hour window is what the rotation logic actually keys on.
+      -> YES (2026-07-27). The in-run signal does cover the window rotation keys on.
   Q4  Is there an event at ~0.9 utilization, and does `status` change there or does only
       `surpassedThreshold` move? `_RATE_LIMIT_UTILIZATION_ROTATE_THRESHOLD = 0.9` is hand-picked.
+      -> OPEN, and harder than assumed: the observed `allowed`/`five_hour` event carried NO
+         `utilization` and NO `surpassedThreshold` at all. Those fields appear only once a warning
+         threshold is crossed, so the 0.9 threshold cannot fire on ordinary events regardless of
+         its value.
   Q5  Do the event's fractional `utilization` and the endpoint's percent `five_hour.utilization`
       agree at the same moment? Free cross-check that 0.9 is in the right units on the right gauge.
+      -> BLOCKED BY Q4: no event carrying `utilization` has been captured alongside an endpoint
+         read, because the only events seen on the five-hour window omit the field.
   Q6  Is `modelUsage` present in the terminal `result`? Unblocks the deferred Phase 2 cost work.
+      -> YES (2026-07-27), with per-model inputTokens / outputTokens / cacheReadInputTokens /
+         costUSD / contextWindow, plus top-level `total_cost_usd`, `api_error_status`,
+         `stop_reason`, `terminal_reason`.
 
 STANDING PREDICTION (recorded so the data can refute it rather than be rationalized after)
 ------------------------------------------------------------------------------------------
@@ -53,7 +67,14 @@ STANDING PREDICTION (recorded so the data can refute it rather than be rationali
 event's `resetsAt` straight into `_force_cooldown()`. So a `seven_day` event at utilization >= 0.9
 cools that seat until the WEEKLY reset — potentially days — discarding the remaining ~10% of weekly
 AND a possibly-fresh five-hour window. I predict this is wrong and that both the threshold and the
-cooldown horizon must become window-aware. Q3 and Q4 settle it.
+cooldown horizon must become window-aware.
+
+  -> STILL UNTESTED as of 2026-07-27. I originally wrote "Q3 and Q4 settle it"; that was wrong.
+     Q3 came back YES but says nothing about the cooldown horizon, and Q4 is not merely open but
+     may be unreachable by this route, since five-hour events omit `utilization` entirely. The
+     prediction needs a `seven_day` event at high utilization — which arrives on the Tier-1 passive
+     tap, not from a five-hour burn. Recording the misprediction rather than quietly restating the
+     claim: the experiment I designed could not have tested the thing I said it would test.
 """
 
 from __future__ import annotations
@@ -575,7 +596,11 @@ def cmd_burn(args: argparse.Namespace) -> int:
         line = f"  call {index + 1}/{max_calls}: {state}  records={len(records)}"
         if current.five_hour_pct is not None:
             line += f"  five_hour~{current.five_hour_pct:.1f}%"
-        print(line)
+        # flush=True because a burn runs for ~15 minutes and is almost always redirected to a log
+        # that someone (or a monitor) is tailing. Python buffers its own stdout when stdout is not a
+        # tty, and `stdbuf` does NOT override that — so without this the entire progress stream
+        # appears only at exit, which is indistinguishable from a hung run.
+        print(line, flush=True)
 
         if index == 0 and result.get("ok") and not records:
             # SILENCE IS NOT SUCCESS. Wall detection reads these records, so a burn that records

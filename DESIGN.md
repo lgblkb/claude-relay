@@ -217,6 +217,47 @@ therefore cool a seat until the **weekly** reset — days — discarding the rem
 *and* a possibly-fresh five-hour window. Both the threshold and the cooldown horizon likely need
 to become window-aware.
 
+#### Results (2026-07-27 Tier-2 run)
+
+The first real capture produced this envelope, and it changed three things:
+
+```json
+{"status":"allowed","resetsAt":1785105000,"rateLimitType":"five_hour",
+ "overageStatus":"rejected","overageDisabledReason":"org_level_disabled",
+ "isUsingOverage":false}
+```
+
+- **Q3 — answered YES.** `rateLimitType: "five_hour"` exists, so the in-run signal genuinely
+  covers the window the rotation logic keys on. Previously only `seven_day` had ever been seen,
+  which had left open the possibility that the authoritative signal covered a window the
+  supervisor did not rotate on.
+- **Q6 — answered YES, richly.** The terminal `result` carries `modelUsage` with per-model
+  `inputTokens` / `outputTokens` / `cacheReadInputTokens` / `costUSD` / `contextWindow`, plus a
+  top-level `total_cost_usd`, `api_error_status`, `stop_reason` and `terminal_reason`. Phase 2 has
+  everything it needs; only the correlation and the cost model remain.
+- **A live HIGH-severity bug, now fixed.** `status: "allowed"` — the ordinary healthy value — was
+  absent from `_KNOWN_SAFE_RATE_LIMIT_STATUSES`, so routine events were classified UNRECOGNIZED
+  and rotated the seat off with a forced cooldown until `resetsAt`. On a `five_hour` event that
+  cools a usable seat for up to five hours; with a two-seat fleet the supervisor stalls itself.
+  The original reasoning — *"unknown → assume limited is the conservative direction"* — was
+  backwards for this signal, because this paragraph's own Invariant #2 makes disk and the endpoint
+  primary. A false positive here breaks rotation; a false negative defers to a mechanism that was
+  already authoritative.
+
+Two schema notes from the same envelope:
+
+- `overageStatus` / `overageDisabledReason` are undocumented additions. `overageStatus:
+  "rejected"` means the **org disabled overage spending**, not that the request was denied — a
+  substring scan for `"rejected"` would read a healthy event as a wall.
+- the event carried **no `utilization` and no `surpassedThreshold` at all**. Those appear only
+  once a warning threshold is crossed, so `_RATE_LIMIT_UTILIZATION_ROTATE_THRESHOLD` cannot fire
+  on a plain `allowed` event regardless of its value.
+
+**Q1, Q2, Q4 remain open** — reaching them needs a genuinely walled window, which the corrected
+harness is built to capture. The standing prediction above is **untested**: it concerns a
+`seven_day` event at high utilization, and the only high-utilization event ever seen is the
+original `seven_day`/0.76 one, below the 0.9 threshold.
+
 ## 5. gad-kit brain: triage, outcome & the recovery-routing fix (`gadkit.py`)
 
 **Feasibility Critical finding:** `AGENT-DEAD` writes NOTHING to disk (the failed
