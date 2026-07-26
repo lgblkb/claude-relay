@@ -2103,6 +2103,27 @@ class InstalledGadKitStatusVocabularyContractTests(unittest.TestCase):
         "SCAFFOLDED": "gad-init.js only — claude-relay never invokes gad-init.js",
         "PARTIAL": "gad-init.js only — claude-relay never invokes gad-init.js",
         "ABORTED": "gad-init.js only — claude-relay never invokes gad-init.js",
+        # --- added 2026-07-27, first run of this test against installed gad-kit 2.1.0 ---
+        # gad-init.js's scaffolding placeholder marker, in two forms: the `# ADAPT ME` comment the
+        # scaffolder leaves in a gate whose stack it could not detect, and the "ADAPT" prefix on
+        # templates/test_leakage.py's pytest.skip messages (which templates/gate-ml.sh greps for to
+        # print its leakage-unconfigured warning). A marker in generated FILE CONTENT, never a
+        # status any workflow returns — and gad-init.js is out of scope regardless, per the three
+        # entries above.
+        "ADAPT": "gad-init.js scaffolding placeholder marker in generated file content, never a status",
+        # gad-generation.js source comment (live-verified against 2.1.0): "...and ideation numbering
+        # to a corrupted generation like \"G31\". Coerce a clean numeric string, else..." — a
+        # hypothetical corrupted GENERATION LABEL inside a comment explaining why the numeric
+        # coercion exists. Not a status field value at all, and never returned. Same shape as
+        # 'FAILED' above.
+        "G31": "appears only inside a code comment as a hypothetical corrupted generation label",
+        # Three unrelated non-status uses, none of them a returned value: (1) English prose inside
+        # agent instruction strings ("...set mustRevise=true, and STOP — do not attempt Jobs 0-4"),
+        # (2) a source comment in gad-generation.js about agent()→null ambiguity ("the usage window
+        # / platform is down — STOP"), and (3) gad-run.js's `STOP_ON_BLOCKED` config identifier.
+        # NOTE: the RELATED token 'STOPPED-ON-BLOCKED' above is a real gad-run.js stop reason and is
+        # allowlisted for a completely different, conditional reason — do not conflate the two.
+        "STOP": "agent-prose imperative, a source comment, and the STOP_ON_BLOCKED config identifier",
     }
 
     def setUp(self) -> None:
