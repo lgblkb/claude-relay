@@ -1,6 +1,10 @@
-"""LIVE test for the `LS-1-usage-endpoint` seam declared in `.gad/live-seams.json`. Runs a
-REAL, read-only GET against `https://api.anthropic.com/api/oauth/usage` using whichever
-usable seat this box already has logged in — no mock, no fixture.
+"""LIVE test for the `LS-1-usage-endpoint` seam. Runs a REAL, read-only GET against
+`https://api.anthropic.com/api/oauth/usage` using whichever usable seat this box already has
+logged in — no mock, no fixture.
+
+(This docstring previously said the seam was "declared in `.gad/live-seams.json`". That file has
+never existed in this repo: claude-relay is the GAD *supervisor*, not a GAD-managed project. The
+seam declaration is this docstring. Corrected 2026-07-27.)
 
 This is the single most important ground-truth claim in the whole design (DESIGN.md §0's
 "live-confirmed" endpoint shape), so it is `auto-verifiable`: it runs automatically whenever
@@ -31,6 +35,14 @@ class UsageEndpointLiveTest(unittest.TestCase):
             snapshot = usage.fetch_usage(seat.path)
         except usage.NeedsLoginError as exc:
             self.skipTest(f"PROBE-SKIPPED: seat became unusable between discovery and fetch: {exc}")
+        except usage.RateLimited as exc:
+            # `RateLimited` is NOT a `UsageFetchError`, so before 2026-07-27 a 429 escaped BOTH
+            # handlers here and surfaced as a test ERROR — contradicting this module's own
+            # "gracefully PROBE-SKIPS (not fails)" claim above. Not hypothetical: the endpoint
+            # returns `Retry-After: ~300` after only a few dozen reads in a few minutes, so anyone
+            # running this suite twice in quick succession saw a red seam for an environment
+            # condition. A 429 says nothing about the shape assertions below.
+            self.skipTest(f"PROBE-SKIPPED: usage endpoint rate-limited us: {exc}")
         except usage.UsageFetchError as exc:
             self.fail(f"live usage endpoint call failed: {exc}")
 

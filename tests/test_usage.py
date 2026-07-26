@@ -267,3 +267,33 @@ class B7FetchUsageReadPhaseNetworkExceptionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BoolUtilizationRejectionTests(unittest.TestCase):
+    """A boolean in `five_hour.utilization` must never be read as a percent.
+
+    `isinstance(True, int)` is True in Python, so a bare `float(raw)` turns True into 1.0. On this
+    0-100 percent gauge that reads as a nearly-EMPTY window, so claude-relay would keep dispatching
+    work to a seat it should have rotated off — the missed-rotation direction Invariant #2 exists to
+    prevent. Found 2026-07-27 while building the rate-limit calibration harness.
+    """
+
+    def _snapshot(self, utilization: object) -> usage.UsageSnapshot:
+        return usage.UsageSnapshot.from_json({"five_hour": {"utilization": utilization}}, fetched_at=0.0)
+
+    def test_true_is_rejected_rather_than_read_as_one_percent(self) -> None:
+        self.assertIsNone(usage.session_utilization(self._snapshot(True)))
+
+    def test_false_is_rejected_rather_than_read_as_zero_percent(self) -> None:
+        self.assertIsNone(usage.session_utilization(self._snapshot(False)))
+
+    def test_a_rejected_bool_does_not_become_a_zero_percent_reading_downstream(self) -> None:
+        """`session_percent()` falls back to 0.0 when the gauge is unreadable. That is correct for
+        ranking, but assert it explicitly: the dangerous outcome would be 1.0 (a real-looking
+        percent) rather than the honest 0.0-plus-absent-session fallback.
+        """
+        self.assertEqual(usage.session_percent(self._snapshot(True)), 0.0)
+
+    def test_a_genuine_numeric_reading_still_works(self) -> None:
+        self.assertEqual(usage.session_utilization(self._snapshot(57)), 57.0)
+        self.assertEqual(usage.session_utilization(self._snapshot(57.5)), 57.5)

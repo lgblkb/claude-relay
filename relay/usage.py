@@ -167,6 +167,17 @@ def session_utilization(usage: UsageSnapshot) -> float | None:
     raw = usage.five_hour.get("utilization")
     if raw is None:
         return None
+    # `bool` must be rejected BEFORE `float()`: `isinstance(True, int)` is True in Python, so a
+    # boolean would coerce to 1.0 — and on this 0-100 PERCENT gauge that reads as "1% used", i.e.
+    # a nearly-empty window. The failure direction therefore points the wrong way: claude-relay
+    # would keep dispatching work to a seat it should have rotated off, which is exactly the
+    # missed-rotation outcome Invariant #2 exists to prevent. Found 2026-07-27 while building the
+    # rate-limit calibration harness, whose own `_pct()` had the identical latent defect. Defensive
+    # rather than observed: the endpoint has never sent a bool here, but it does send booleans in
+    # many neighbouring fields (`spend.enabled`, `extra_usage.is_enabled`, ...), so a field rename
+    # or a schema change putting one here is a realistic way to reach this.
+    if isinstance(raw, bool):
+        return None
     try:
         return float(raw)
     except (TypeError, ValueError):
@@ -306,6 +317,25 @@ def fetch_usage(seat_dir: Path, timeout: float = DEFAULT_TIMEOUT_S) -> UsageSnap
     """Perform ONE live GET against the usage endpoint for this seat. Raises NeedsLoginError,
     RateLimited, or UsageFetchError on failure. Never logs the Authorization header.
     """
+    parsed = fetch_usage_raw(seat_dir, timeout=timeout)
+    return UsageSnapshot.from_json(parsed, fetched_at=time.time())
+
+
+def fetch_usage_raw(seat_dir: Path, timeout: float = DEFAULT_TIMEOUT_S) -> dict[str, Any]:
+    """The same single live GET as `fetch_usage()`, but returning the endpoint's payload VERBATIM
+    instead of the lossy `UsageSnapshot` projection.
+
+    `UsageSnapshot.from_json()` keeps only the four fields the rotation logic needs, so any field
+    Anthropic adds — or any enum value we have not yet seen — is silently dropped. The rate-limit
+    calibration harness (`bin/rate-limit-probe`) needs the unprojected payload precisely because
+    its job is to discover fields and enum values this module does not know about yet.
+
+    Kept as the single HTTP implementation for both callers on purpose: duplicating the request
+    would duplicate the token handling and the three-way error contract (Invariant #5 — the
+    Authorization header must never reach a log — and Invariant #3's "may raise only the three
+    documented exception types"), and a capture tool drifting from production auth behaviour is
+    exactly how a harness ends up measuring something other than what production does.
+    """
     token = _load_access_token(seat_dir)  # kept in a local variable only, never logged
     # USAGE_URL is our own fixed https://api.anthropic.com constant, not user input — the
     # flake8-bandit "audit url open" check is a false positive here.
@@ -348,7 +378,7 @@ def fetch_usage(seat_dir: Path, timeout: float = DEFAULT_TIMEOUT_S) -> UsageSnap
         raise UsageFetchError("usage endpoint returned non-JSON body") from exc
     if not isinstance(parsed, dict):
         raise UsageFetchError("usage endpoint returned a non-object JSON body")
-    return UsageSnapshot.from_json(parsed, fetched_at=time.time())
+    return parsed
 
 
 @dataclasses.dataclass

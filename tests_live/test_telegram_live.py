@@ -1,4 +1,4 @@
-"""LIVE test for the `LS-2-telegram-sendmessage` seam declared in `.gad/live-seams.json`.
+"""LIVE test for the `LS-2-telegram-sendmessage` seam.
 Sends a REAL Telegram message via `notify.send_telegram()` — no mock.
 
 Classified `operator-receipt` (metered/interactive, not auto-verifiable): it costs the

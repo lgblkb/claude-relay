@@ -177,6 +177,45 @@ Phase 2 because it needs sound per-unit cost calibration, which v1 does not have
   Not implemented: Phase 2 still needs to read `result.modelUsage` per invocation, correlate it
   against the generation actually committed, and derive the per-unit cost — this note only
   records where the raw data lives so that work has a starting point.
+  **Collection now exists (2026-07-27):** `relay/capture.py` is an opt-in passive tap
+  (`CLAUDE_RELAY_CAPTURE_DIR`) that records every terminal `result` envelope — `modelUsage`
+  included — from normal runs, at ~zero marginal cost, because `runner.py` already reads every
+  NDJSON line. Phase 2 no longer has to build its own collection path; it needs only the
+  correlation and the cost model. The same tap collects `rate_limit_event` envelopes for the
+  rate-limit calibration below, which is why one mechanism serves both.
+
+### 4a. Rate-limit signal calibration (`bin/rate-limit-probe`)
+
+`detector._KNOWN_SAFE_RATE_LIMIT_STATUSES` is a **one-element** frozenset and
+`_RATE_LIMIT_UTILIZATION_ROTATE_THRESHOLD` is a hand-picked `0.9`. Both encode a guess about an
+enum whose only ever-observed value is `allowed_warning` at `utilization: 0.76`. Rotation and
+forced multi-hour cooldowns ride on that guess, so it is the largest remaining uncalibrated
+constant in the design.
+
+It cannot be calibrated by a conventional test: `utilization` is a property of the account's
+window, not of the test fixture — it can only be *spent*, never *set*. Hence a cost-tiered harness
+(Tier 0 free / Tier 0.5 prices the spend / Tier 1 passive / Tier 2 spends), documented in full at
+the top of `relay/ratelimit_probe.py` together with six pre-registered questions.
+
+Two schema facts worth recording here, both from the 2026-07-27 Tier-0 run:
+
+- The endpoint sends ~**55** leaf fields; `UsageSnapshot.from_json()` keeps **three**
+  (`five_hour`, `seven_day`, `limits`). Everything else — `extra_usage.*` (overage state),
+  `spend.*` (with its own `percent`/`severity`), and per-model weekly gauges
+  `seven_day_opus` / `seven_day_sonnet` — is invisible to every rotation decision. The per-model
+  gauges are present-but-**null** on the observed account, so this is a future-proofing note, not
+  a live bug: if they ever populate, a seat whose *Opus* weekly is exhausted while its aggregate
+  weekly is not would look healthy to `session_percent()`.
+- The endpoint 429s readily — `Retry-After: 300` after a few dozen reads within minutes. The
+  harness therefore polls at the same 90s `poll_ttl` §4 already specifies, rather than inventing a
+  faster cadence for the tool most likely to run beside a live supervisor.
+
+**Standing prediction, recorded before the data exists** (so it can be refuted rather than
+rationalized): `_rate_limit_event_action()` ignores `rate_limit_type` and feeds the event's
+`resetsAt` straight into `_force_cooldown()`. A `seven_day` event at utilization ≥ 0.9 would
+therefore cool a seat until the **weekly** reset — days — discarding the remaining ~10% of weekly
+*and* a possibly-fresh five-hour window. Both the threshold and the cooldown horizon likely need
+to become window-aware.
 
 ## 5. gad-kit brain: triage, outcome & the recovery-routing fix (`gadkit.py`)
 

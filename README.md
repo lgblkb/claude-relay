@@ -241,7 +241,57 @@ decision order against fixture `.gad/` states (including the FINISH-vs-restart r
 tests), `detector.classify()`, the notify sinks/dedupe/regexes, and `pick_seat()`/
 `SingleInstanceLock`. No network calls.
 
-`tests_live/` holds real (non-mocked) live-verification tests for the three network/process
-seams this tool touches (the usage endpoint, Telegram, and spawning `claude` itself) — see
-`.gad/live-seams.json`. These are NOT part of the offline suite above; run them explicitly
-(most require opt-in env vars, since two of the three cost real quota / send a real message).
+`tests_live/` holds real (non-mocked) live-verification tests for the network/process seams this
+tool touches: the usage endpoint, Telegram, spawning `claude` itself, and (added 2026-07-27) the
+rate-limit envelope capture. These are NOT part of the offline suite above; run them explicitly —
+most require opt-in env vars, since they cost real quota or send a real message. Each seam's
+declaration lives in its own test module's docstring; this repo is the GAD *supervisor* and is not
+itself GAD-managed, so there is no `.gad/live-seams.json` here despite older references to one.
+
+| module | seam | gate |
+| --- | --- | --- |
+| `test_usage_endpoint_live.py` | usage endpoint | auto (probe-skips without a seat) |
+| `test_telegram_live.py` | Telegram send | `CLAUDE_RELAY_LIVE_TELEGRAM=1` |
+| `test_claude_runner_live.py` | spawning `claude` | `CLAUDE_RELAY_LIVE_CLAUDE_RUN=1` |
+| `test_rate_limit_capture_live.py` | Tier 0 usage schema | auto (probe-skips without a seat) |
+| `test_rate_limit_capture_live.py` | Tier 2 real child + tap | `CLAUDE_RELAY_LIVE_CLAUDE_RUN=1` |
+
+## Rate-limit calibration
+
+Two constants in `relay/detector.py` are educated guesses rather than measurements:
+`_KNOWN_SAFE_RATE_LIMIT_STATUSES` is a **one-element** set, and
+`_RATE_LIMIT_UTILIZATION_ROTATE_THRESHOLD` is a hand-picked `0.9`. Only one
+`rate_limit_event.status` value has ever been observed live — `allowed_warning`, at
+`utilization: 0.76` — yet rotation decisions and multi-hour forced cooldowns ride on that guess.
+
+The obstacle is that `utilization` is a property of the **account's window**, not of anything a
+test can set up: you cannot manufacture 90% utilization, only spend it. `bin/rate-limit-probe`
+is therefore tiered by cost, and only the last tier spends:
+
+```bash
+./bin/rate-limit-probe baseline                 # TIER 0 — zero tokens
+./bin/rate-limit-probe exchange-rate --seat X   # TIER 0.5 — a few calls, prices a burn
+./bin/rate-limit-probe burn --seat X            # TIER 2 — spends; walls one 5-hour window
+./bin/rate-limit-probe report                   # answers the pre-registered questions
+```
+
+- **Tier 0** dumps the usage endpoint's *verbatim* payload per seat via `usage.fetch_usage_raw()`.
+  `UsageSnapshot` keeps 3 of the ~55 fields the endpoint actually sends, so unknown fields and
+  unseen enum values are invisible to every other code path. It also ranks seats by burn cost.
+- **Tier 0.5** spends a deliberately tiny amount and reports how many points of **weekly** quota
+  one point of **five-hour** costs — turning Tier 2's price into a number you approve in advance.
+- **Tier 1** is passive and has no subcommand: set `CLAUDE_RELAY_CAPTURE_DIR` and
+  `relay/capture.py` records every `rate_limit_event` and terminal `result` envelope from normal
+  runs at ~zero marginal cost. This is what eventually catches a real `seven_day` wall, which is
+  far too expensive to provoke on purpose. It never records `assistant` envelopes — those carry
+  tool output, which can contain repository contents or secrets (Invariant #5).
+- **Tier 2** drives one seat's five-hour window to its wall. Cheap in the only sense that matters:
+  unused five-hour capacity is not banked, so burning the *tail* of a window on a seat you were
+  not going to use costs only the weekly quota those tokens also debit. It bypasses the
+  supervisor's own `ceiling_pct = 70` by invoking `claude -p` directly, caps spend in weekly
+  points, grants the burn no tools, and **fails closed** — if the usage endpoint becomes
+  unreadable it stops, because the spend cap cannot be enforced without it.
+
+The pre-registered questions (fixed before any data was collected) are documented at the top of
+`relay/ratelimit_probe.py`, along with a standing prediction about a suspected window-awareness
+bug in `_force_cooldown()`, recorded so the data can refute it rather than be rationalized after.
