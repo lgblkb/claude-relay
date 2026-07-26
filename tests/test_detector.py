@@ -537,3 +537,75 @@ class LimitSignatureSplitTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RateLimitEventSafeStatusTests(unittest.TestCase):
+    """`status: "allowed"` must never trigger a rotation.
+
+    Live HIGH-severity regression, found 2026-07-27 by capturing a real envelope:
+
+      {"status":"allowed","resetsAt":1785105000,"rateLimitType":"five_hour",
+       "overageStatus":"rejected","overageDisabledReason":"org_level_disabled",
+       "isUsingOverage":false}
+
+    `_KNOWN_SAFE_RATE_LIMIT_STATUSES` held only `allowed_warning`, so this ordinary healthy event
+    was classified UNRECOGNIZED and returned CONTINUE_ROTATE with a forced cooldown until
+    `resetsAt` — up to five hours on a perfectly usable seat. With a small fleet every seat is
+    cooled almost immediately and the supervisor stalls itself, the exact opposite of the
+    availability it exists to provide.
+
+    The original reasoning ("unknown -> assume limited is the conservative direction") was
+    backwards. Per Invariant #2 disk state and the usage endpoint are the PRIMARY deciders and
+    `ceiling_pct` already catches real limits, so a false positive here breaks rotation outright
+    while a false negative merely defers to the mechanism that was already authoritative.
+    """
+
+    @staticmethod
+    def _event(status: str, **extra: object) -> list[str]:
+        info: dict[str, object] = {"status": status, "rateLimitType": "five_hour", "resetsAt": 1785105000}
+        info.update(extra)
+        return [json.dumps({"type": "rate_limit_event", "rate_limit_info": info})]
+
+    def test_allowed_does_not_trigger_a_rotation(self) -> None:
+        self.assertIsNone(detector._rate_limit_event_action(self._event("allowed")))
+
+    def test_the_exact_live_envelope_does_not_trigger_a_rotation(self) -> None:
+        tail = self._event(
+            "allowed",
+            overageStatus="rejected",
+            overageDisabledReason="org_level_disabled",
+            isUsingOverage=False,
+        )
+        self.assertIsNone(detector._rate_limit_event_action(tail))
+
+    def test_allowed_warning_without_high_utilization_does_not_rotate(self) -> None:
+        self.assertIsNone(detector._rate_limit_event_action(self._event("allowed_warning", utilization=0.76)))
+
+    def test_allowed_warning_at_high_utilization_still_rotates(self) -> None:
+        action = detector._rate_limit_event_action(self._event("allowed_warning", utilization=0.95))
+        self.assertIsNotNone(action)
+
+    def test_a_future_allowed_variant_is_safe_by_prefix(self) -> None:
+        self.assertIsNone(detector._rate_limit_event_action(self._event("allowed_final_warning")))
+
+    def test_a_genuinely_blocking_status_still_rotates(self) -> None:
+        for status in ("rejected", "blocked", "exceeded", "denied", "throttled"):
+            with self.subTest(status=status):
+                self.assertIsNotNone(detector._rate_limit_event_action(self._event(status)))
+
+    def test_both_observed_statuses_are_recorded_in_the_constant(self) -> None:
+        """The set is a literal record of what has been SEEN; the prefix rule is the generalization.
+        Keep them distinct so shrinking the record is visible.
+        """
+        self.assertIn("allowed", detector._KNOWN_SAFE_RATE_LIMIT_STATUSES)
+        self.assertIn("allowed_warning", detector._KNOWN_SAFE_RATE_LIMIT_STATUSES)
+
+    def test_an_event_with_no_utilization_field_does_not_crash_or_rotate(self) -> None:
+        """The live five_hour event carried no `utilization` at all — that field appears only once a
+        warning threshold is crossed.
+        """
+        signal = detector.latest_rate_limit_signal(self._event("allowed"))
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertIsNone(signal.utilization)
+        self.assertEqual(signal.rate_limit_type, "five_hour")

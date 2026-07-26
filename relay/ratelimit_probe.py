@@ -511,9 +511,18 @@ def cmd_exchange_rate(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------------------------
 
 
-def _walled(records: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """The first captured `rate_limit_event` whose status is NOT the one known-safe value. That is
-    by definition the calibration payload we came for.
+def _novel_status(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The first captured `rate_limit_event` whose status is not known-safe — a candidate wall.
+
+    Named `_novel_status`, NOT `_walled`, because the first live run proved the difference matters.
+    It stopped the burn announcing "WALLED STATE CAPTURED: status='allowed'" — and `allowed` is the
+    ordinary healthy status, the opposite of a wall. Calling every unfamiliar value a wall
+    overclaimed the finding and cut the burn short at 80% of the window.
+
+    Deliberately delegates to `detector._is_safe_rate_limit_status()` rather than keeping a private
+    copy: the burn's stop condition and production's rotate condition must move together, or the
+    harness stops on values production ignores (and vice versa). The `allowed` miss WAS the
+    production bug this run uncovered, so the shared predicate is the fix in both places at once.
     """
     from . import detector
 
@@ -522,7 +531,7 @@ def _walled(records: list[dict[str, Any]]) -> dict[str, Any] | None:
         if not isinstance(info, dict):
             continue
         status = info.get("status")
-        if isinstance(status, str) and status not in detector._KNOWN_SAFE_RATE_LIMIT_STATUSES:
+        if isinstance(status, str) and not detector._is_safe_rate_limit_status(status):
             return record
     return None
 
@@ -561,7 +570,7 @@ def cmd_burn(args: argparse.Namespace) -> int:
         calls.append(result)
 
         records = _collect_records(capture_dir)
-        hit = _walled(records)
+        hit = _novel_status(records)
         state = "ok" if result.get("ok") else f"exit={result.get('returncode')} {result.get('error') or ''}"
         line = f"  call {index + 1}/{max_calls}: {state}  records={len(records)}"
         if current.five_hour_pct is not None:
@@ -585,9 +594,13 @@ def cmd_burn(args: argparse.Namespace) -> int:
 
         if hit is not None:
             info = (hit.get("envelope") or {}).get("rate_limit_info") or {}
-            print(f"\n*** WALLED STATE CAPTURED: status={info.get('status')!r} ***")
+            # "NOVEL", not "WALLED": this is a status production does not recognize as safe, which
+            # is a candidate wall and worth stopping for — but whether it IS a wall is a judgement
+            # for whoever reads the payload, not a claim this function can make.
+            print(f"\n*** NOVEL (non-safe) STATUS CAPTURED: status={info.get('status')!r} ***")
             print(json.dumps(info, indent=2))
-            stop_reason = "walled-state-captured"
+            print("  Stopping here so the payload can be judged before more quota is spent.")
+            stop_reason = "novel-status-captured"
             break
 
         if not result.get("ok"):

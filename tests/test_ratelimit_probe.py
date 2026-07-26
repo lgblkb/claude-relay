@@ -8,8 +8,8 @@ The load-bearing tests here are the SAFETY RAILS. This harness deliberately spen
 worth of quota, so the caps must be provably impossible to exceed by flag or by bug:
   * `--max-calls` is clamped to `_MAX_BURN_CALLS` regardless of what is passed.
   * the burn prompt grants no tools, so a burn call cannot touch a repository (Invariant #6).
-  * `_walled()` treats anything outside the single known-safe status as the stop signal, so an
-    unrecognized-but-genuine wall halts the burn instead of being burned straight through.
+  * `_novel_status()` delegates its stop condition to `detector._is_safe_rate_limit_status()`, so
+    the burn and production rotation can never disagree about which statuses are benign.
 """
 
 from __future__ import annotations
@@ -124,18 +124,18 @@ class SchemaWalkTests(unittest.TestCase):
 
 
 class WalledDetectionTests(unittest.TestCase):
-    def test_known_safe_status_is_not_treated_as_walled(self) -> None:
-        self.assertIsNone(ratelimit_probe._walled([_event(status="allowed_warning")]))
+    def test_known_safe_status_is_not_treated_as_novel(self) -> None:
+        self.assertIsNone(ratelimit_probe._novel_status([_event(status="allowed_warning")]))
 
-    def test_any_status_outside_known_safe_is_treated_as_walled(self) -> None:
-        hit = ratelimit_probe._walled([_event(status="rejected")])
+    def test_any_status_outside_known_safe_is_treated_as_novel(self) -> None:
+        hit = ratelimit_probe._novel_status([_event(status="rejected")])
         self.assertIsNotNone(hit)
         assert hit is not None
         self.assertEqual(hit["envelope"]["rate_limit_info"]["status"], "rejected")
 
-    def test_returns_the_first_walled_event_not_the_last(self) -> None:
+    def test_returns_the_first_novel_event_not_the_last(self) -> None:
         records = [_event(status="allowed_warning"), _event(status="blocked"), _event(status="rejected")]
-        hit = ratelimit_probe._walled(records)
+        hit = ratelimit_probe._novel_status(records)
         assert hit is not None
         self.assertEqual(hit["envelope"]["rate_limit_info"]["status"], "blocked")
 
@@ -145,17 +145,16 @@ class WalledDetectionTests(unittest.TestCase):
         status production already considers safe, or stop on one it does not.
         """
         for status in detector._KNOWN_SAFE_RATE_LIMIT_STATUSES:
-            self.assertIsNone(ratelimit_probe._walled([_event(status=status)]))
+            self.assertIsNone(ratelimit_probe._novel_status([_event(status=status)]))
 
-    def test_malformed_rate_limit_info_is_not_mistaken_for_a_wall(self) -> None:
-        self.assertIsNone(ratelimit_probe._walled([{"envelope": {"type": "rate_limit_event"}}]))
-        self.assertIsNone(
-            ratelimit_probe._walled([{"envelope": {"type": "rate_limit_event", "rate_limit_info": "x"}}])
-        )
+    def test_malformed_rate_limit_info_is_not_mistaken_for_a_novel_status(self) -> None:
+        self.assertIsNone(ratelimit_probe._novel_status([{"envelope": {"type": "rate_limit_event"}}]))
+        malformed = {"envelope": {"type": "rate_limit_event", "rate_limit_info": "x"}}
+        self.assertIsNone(ratelimit_probe._novel_status([malformed]))
 
-    def test_non_string_status_is_not_mistaken_for_a_wall(self) -> None:
+    def test_non_string_status_is_not_mistaken_for_a_novel_status(self) -> None:
         record = {"envelope": {"type": "rate_limit_event", "rate_limit_info": {"status": 429}}}
-        self.assertIsNone(ratelimit_probe._walled([record]))
+        self.assertIsNone(ratelimit_probe._novel_status([record]))
 
 
 class SummarizeTests(unittest.TestCase):
@@ -382,3 +381,69 @@ class FailClosedTests(unittest.TestCase):
             artifact = json.loads(next(Path(tmp).glob("tier0.5-exchange-rate-*.json")).read_text())
             self.assertTrue(artifact["below_gauge_resolution"])
             self.assertGreater(artifact["seven_day_pts_per_five_hour_pt_upper_bound"], 0.0)
+
+
+class ObservedStatusVocabularyTests(unittest.TestCase):
+    """Pins the statuses actually seen live, so the set cannot silently shrink back."""
+
+    def test_allowed_is_treated_as_safe(self) -> None:
+        """Observed 2026-07-27 with rateLimitType=five_hour. Its absence from the known-safe set was
+        a live HIGH-severity bug: `allowed` is the ORDINARY healthy status, so production classified
+        routine events as limits and force-cooled healthy seats.
+        """
+        self.assertIsNone(ratelimit_probe._novel_status([_event(status="allowed")]))
+
+    def test_allowed_warning_is_treated_as_safe(self) -> None:
+        self.assertIsNone(ratelimit_probe._novel_status([_event(status="allowed_warning")]))
+
+    def test_a_hypothetical_future_allowed_variant_is_safe_by_prefix(self) -> None:
+        """A status asserting the request was ALLOWED cannot also be a denial. Without the prefix
+        rule, a new `allowed_final_warning` would stall the whole fleet the first time it appeared.
+        """
+        self.assertIsNone(ratelimit_probe._novel_status([_event(status="allowed_final_warning")]))
+
+    def test_a_genuinely_non_allowed_status_is_still_flagged(self) -> None:
+        for status in ("rejected", "blocked", "exceeded", "denied"):
+            with self.subTest(status=status):
+                self.assertIsNotNone(ratelimit_probe._novel_status([_event(status=status)]))
+
+    def test_an_event_with_no_utilization_field_is_handled(self) -> None:
+        """The live `allowed`/`five_hour` event carried NO `utilization` and no `surpassedThreshold`
+        at all — those appear only once a warning threshold is crossed. Summarizing must not assume
+        they exist.
+        """
+        record = {
+            "envelope": {
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "allowed",
+                    "resetsAt": 1785105000,
+                    "rateLimitType": "five_hour",
+                    "overageStatus": "rejected",
+                    "overageDisabledReason": "org_level_disabled",
+                    "isUsingOverage": False,
+                },
+            }
+        }
+        got = ratelimit_probe.summarize([record])
+        self.assertIsNone(got["Q4_max_utilization"])
+        self.assertEqual(got["Q4_surpassed_thresholds"], [])
+        self.assertEqual(got["Q3_limit_types"], {"five_hour": 1})
+        self.assertTrue(got["Q3_five_hour_observed"])
+
+    def test_overage_status_rejected_is_not_mistaken_for_the_request_being_rejected(self) -> None:
+        """`overageStatus: "rejected"` means the ORG disabled overage spending, not that this request
+        was denied. A naive scan for the substring "rejected" would misread a healthy event as a wall.
+        """
+        record = {
+            "envelope": {
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "allowed",
+                    "rateLimitType": "five_hour",
+                    "overageStatus": "rejected",
+                    "overageDisabledReason": "org_level_disabled",
+                },
+            }
+        }
+        self.assertIsNone(ratelimit_probe._novel_status([record]))
