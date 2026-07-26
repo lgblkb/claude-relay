@@ -6,6 +6,11 @@ branch (genuinely offline) or `send_telegram`/`get_updates` themselves mocked ou
 
 from __future__ import annotations
 
+import http.client
+import json
+import stat
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -16,6 +21,31 @@ from relay.config import Config
 
 def _state() -> dict:
     return cooldown.load_state(Path("/nonexistent-claude-relay-state.json"))
+
+
+def _run_git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=str(repo), check=True, capture_output=True, text=True)
+
+
+def _init_gad_repo(repo: Path, decision_id: str = "D1") -> None:
+    """A minimal committed `.gad`-bootstrapped repo with one OPEN ownerDecision — enough for
+    `resolve_owner_decision()` (called transitively via `poll_telegram_updates`'s resolve
+    branch) to find and answer it."""
+    repo.mkdir(parents=True, exist_ok=True)
+    _run_git(repo, "init", "-q")
+    _run_git(repo, "config", "user.email", "test@example.com")
+    _run_git(repo, "config", "user.name", "Test")
+    gad = repo / ".gad"
+    gad.mkdir()
+    index = {
+        "project": "t",
+        "nextGen": 1,
+        "generations": [],
+        "ownerDecisions": [{"id": decision_id, "question": "pick a DB", "blocksGen": 1, "status": "open"}],
+    }
+    (gad / "generations-index.json").write_text(json.dumps(index, indent=2), encoding="utf-8")
+    _run_git(repo, "add", "-A")
+    _run_git(repo, "commit", "-q", "-m", "seed .gad state")
 
 
 def _update(update_id: int, text: str, chat_id: str = "123") -> dict:
@@ -69,6 +99,38 @@ class DispatchGracefulDegradeTests(unittest.TestCase):
     def test_unknown_sink_falls_back_to_stdout(self) -> None:
         cfg = Config(notify_sink="carrier-pigeon")
         self.assertTrue(notify.dispatch(cfg, "hello"))
+
+
+class B7ReadPhaseNetworkExceptionTests(unittest.TestCase):
+    """B7 audit fix: `urlopen()` wraps CONNECT-phase failures as `URLError`, but a READ-phase
+    failure (after the connection succeeded) can raise a raw `OSError` subclass or
+    `http.client.HTTPException` instead — measured in practice as `TimeoutError`,
+    `ConnectionResetError`, `http.client.BadStatusLine`. Every "never raises" notify.py entry
+    point must swallow these exactly like the documented `(HTTPError, URLError)` pair.
+    """
+
+    def test_send_telegram_never_raises_on_a_connection_reset(self) -> None:
+        with mock.patch.object(notify.urllib.request, "urlopen", side_effect=ConnectionResetError("rst")):
+            self.assertFalse(notify.send_telegram("tok", "123", "hello"))
+
+    def test_send_telegram_never_raises_on_a_bad_status_line(self) -> None:
+        with mock.patch.object(
+            notify.urllib.request, "urlopen", side_effect=http.client.BadStatusLine("garbage")
+        ):
+            self.assertFalse(notify.send_telegram("tok", "123", "hello"))
+
+    def test_send_telegram_never_raises_on_a_bare_timeout(self) -> None:
+        with mock.patch.object(notify.urllib.request, "urlopen", side_effect=TimeoutError("timed out")):
+            self.assertFalse(notify.send_telegram("tok", "123", "hello"))
+
+    def test_get_updates_never_raises_on_a_connection_reset(self) -> None:
+        with mock.patch.object(notify.urllib.request, "urlopen", side_effect=ConnectionResetError("rst")):
+            self.assertEqual(notify.get_updates("tok", offset=0), [])
+
+    def test_dispatch_webhook_never_raises_on_a_connection_reset(self) -> None:
+        cfg = Config(notify_sink="webhook", notify_webhook_url="https://example.com/hook")
+        with mock.patch.object(notify.urllib.request, "urlopen", side_effect=ConnectionResetError("rst")):
+            self.assertFalse(notify.dispatch(cfg, "hello"))
 
 
 class ResolveAndStatusRegexTests(unittest.TestCase):
@@ -190,6 +252,58 @@ class PollTelegramUpdatesTests(unittest.TestCase):
         self.assertEqual(out, [])
         sent.assert_not_called()
         self.assertEqual(cooldown.get_telegram_offset(state), 9)  # don't re-fetch ignored messages
+
+
+class PollTelegramResolveCommitStatusTests(unittest.TestCase):
+    """B13 audit fix, second round: the Telegram `resolve <id> <answer>` reply must never read
+    as an ordinary clean resolution when the underlying commit failed — this drives
+    `poll_telegram_updates()`'s REAL `resolve_owner_decision()` call against a real repo (not a
+    mock of it), so the reply text is genuinely derived from `ResolveResult.committed`.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name) / "repo"
+        _init_gad_repo(self.repo)
+
+    def _cfg(self) -> Config:
+        return Config(notify_sink="telegram", telegram_bot_token="tok", telegram_chat_id="123")
+
+    def test_a_clean_resolution_reply_carries_no_warning(self) -> None:
+        cfg, state = self._cfg(), _state()
+        updates = [_update(1, "resolve D1 use postgres")]
+        with (
+            mock.patch.object(notify, "get_updates", return_value=updates),
+            mock.patch.object(notify, "send_telegram", return_value=True) as sent,
+        ):
+            out = notify.poll_telegram_updates(cfg, state, self.repo)
+        self.assertEqual(out, ["resolve D1 -> found=True committed=True"])
+        reply = sent.call_args.args[2]
+        self.assertIn("resolved D1", reply)
+        self.assertNotIn("WARNING", reply)
+
+    def test_a_failed_commit_reply_carries_a_loud_warning(self) -> None:
+        hooks_dir = self.repo / ".git" / "hooks"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hook = hooks_dir / "pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        hook.chmod(hook.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+        cfg, state = self._cfg(), _state()
+        updates = [_update(1, "resolve D1 use postgres")]
+        with (
+            mock.patch.object(notify, "get_updates", return_value=updates),
+            mock.patch.object(notify, "send_telegram", return_value=True) as sent,
+        ):
+            out = notify.poll_telegram_updates(cfg, state, self.repo)
+        self.assertEqual(out, ["resolve D1 -> found=True committed=False"])
+        reply = sent.call_args.args[2]
+        # The resolution DID apply (the operator should not think it was rejected outright)...
+        self.assertIn("resolved D1", reply)
+        # ...but a failure to commit must never be silently reported as an ordinary resolution.
+        self.assertIn("WARNING", reply)
+        self.assertIn("FAILED", reply)
 
 
 if __name__ == "__main__":

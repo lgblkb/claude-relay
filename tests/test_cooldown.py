@@ -29,6 +29,46 @@ class StateIOTests(unittest.TestCase):
         state = cooldown.load_state(self.state_path)
         self.assertEqual(state["seats"], {})
 
+    def test_b14_corrupt_file_is_quarantined_not_silently_discarded(self) -> None:
+        """B14 audit fix: an existing-but-unreadable state file must not vanish silently — it is
+        renamed aside (never deleted) so the operator can inspect what was lost, distinct from
+        the genuinely-missing-file (fresh install) case."""
+        self.state_path.write_text("{not json", encoding="utf-8")
+        cooldown.load_state(self.state_path)
+        self.assertFalse(self.state_path.exists())  # moved aside, not left in place
+        quarantined = list(self.state_path.parent.glob(f"{self.state_path.name}.corrupt-*"))
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(quarantined[0].read_text(encoding="utf-8"), "{not json")
+
+    def test_b14_a_valid_json_non_object_is_also_quarantined(self) -> None:
+        """`load_state()`'s contract is "a JSON OBJECT with this schema" — valid JSON that is
+        merely the wrong shape (e.g. a bare list) is exactly as corrupt for our purposes as
+        unparseable JSON, and must be quarantined the same way, not silently accepted-then-
+        replaced."""
+        self.state_path.write_text("[1, 2, 3]", encoding="utf-8")
+        state = cooldown.load_state(self.state_path)
+        self.assertEqual(state["seats"], {})
+        quarantined = list(self.state_path.parent.glob(f"{self.state_path.name}.corrupt-*"))
+        self.assertEqual(len(quarantined), 1)
+
+    def test_b14_a_missing_file_is_not_treated_as_corrupt(self) -> None:
+        """The fresh-install case must stay silent — no warning, no quarantine file, nothing to
+        preserve, since there was never anything there in the first place."""
+        cooldown.load_state(self.state_path)  # file never existed
+        quarantined = list(self.state_path.parent.glob("*.corrupt-*"))
+        self.assertEqual(quarantined, [])
+
+    def test_b14_save_state_fsyncs_before_returning(self) -> None:
+        """Direct unit coverage that `save_state()` actually calls `os.fsync` on the tmp file's
+        fd (not just that a plain round-trip happens to work, which would pass even with no
+        fsync at all)."""
+        from unittest import mock
+
+        state = cooldown.load_state(self.state_path)
+        with mock.patch.object(cooldown.os, "fsync", wraps=cooldown.os.fsync) as fake_fsync:
+            cooldown.save_state(self.state_path, state)
+        self.assertGreaterEqual(fake_fsync.call_count, 1)
+
     def test_save_then_load_round_trips_and_chmods_600(self) -> None:
         state = cooldown.load_state(self.state_path)
         cooldown.update_seat(state, "/seat/a", has_creds=True, last_percent=42.0)
@@ -74,6 +114,19 @@ class CooldownWindowTests(unittest.TestCase):
 
     def test_clamp_future_none_input(self) -> None:
         self.assertIsNone(cooldown.clamp_future(None))
+
+    def test_clamp_future_rejects_implausibly_far_future(self) -> None:
+        """B17: clamp_future() must be symmetric — an implausibly-far-future `resets_at` (a
+        corrupt value, or a clock skewed forward by e.g. an RTC error) is just as untrustworthy
+        as a past one and must not be recorded as a real cooldown boundary."""
+        garbage_future = (dt.datetime.now(dt.UTC) + dt.timedelta(days=400)).isoformat()
+        self.assertIsNone(cooldown.clamp_future(garbage_future))
+
+    def test_clamp_future_accepts_a_legitimate_weekly_reset(self) -> None:
+        """The longest REAL window this tool waits on is a ~7-day weekly usage-limit reset
+        (usage.py's earliest_reset()) — the far-future guard must not reject that."""
+        weekly_reset = (dt.datetime.now(dt.UTC) + dt.timedelta(days=6, hours=23)).isoformat()
+        self.assertEqual(cooldown.clamp_future(weekly_reset), weekly_reset)
 
 
 class NotifyDedupeTests(unittest.TestCase):
@@ -148,6 +201,103 @@ class RepoBaselineAndStashTests(unittest.TestCase):
         recorded = cooldown.get_last_stash(reloaded, "/repo/a")
         assert recorded is not None
         self.assertEqual(recorded["ref"], "stash@{0}")
+
+
+class IdeationAttemptHeadTests(unittest.TestCase):
+    """The one-attempt-per-HEAD bookkeeping that bounds a research repo's backlog refill
+    (`gadkit._exhausted_backlog_plan()`). Every accessor must degrade on absent/partial state:
+    `triage()` calls them on repos that have never been seen before.
+    """
+
+    def test_absent_key_reads_as_none(self) -> None:
+        state = cooldown.load_state(Path("/nonexistent"))
+        self.assertIsNone(cooldown.get_ideation_attempt_head(state, "/repo/a"))
+
+    def test_set_then_get_round_trips_and_records_a_timestamp(self) -> None:
+        state = cooldown.load_state(Path("/nonexistent"))
+        cooldown.set_ideation_attempt_head(state, "/repo/a", "deadbeef")
+        self.assertEqual(cooldown.get_ideation_attempt_head(state, "/repo/a"), "deadbeef")
+        self.assertIn("ideationAttemptedAt", cooldown.get_repo_entry(state, "/repo/a"))
+
+    def test_set_with_no_head_is_a_noop_and_creates_no_entry(self) -> None:
+        """A repo with no commits cannot be bounded by HEAD identity at all — recording an
+        unbounded attempt would end the crawl on the next triage for the wrong reason.
+        """
+        state = cooldown.load_state(Path("/nonexistent"))
+        cooldown.set_ideation_attempt_head(state, "/repo/a", None)
+        self.assertIsNone(cooldown.get_ideation_attempt_head(state, "/repo/a"))
+        self.assertEqual(state.get("repos", {}), {})
+
+    def test_set_with_no_head_does_not_overwrite_a_recorded_attempt(self) -> None:
+        state = cooldown.load_state(Path("/nonexistent"))
+        cooldown.set_ideation_attempt_head(state, "/repo/a", "deadbeef")
+        cooldown.set_ideation_attempt_head(state, "/repo/a", None)
+        self.assertEqual(cooldown.get_ideation_attempt_head(state, "/repo/a"), "deadbeef")
+
+    def test_clear_removes_the_marker_and_leaves_sibling_bookkeeping_intact(self) -> None:
+        state = cooldown.load_state(Path("/nonexistent"))
+        cooldown.set_clean_baseline(state, "/repo/a", "basehead")
+        cooldown.record_stash(state, "/repo/a", "stash@{0}", ["x.py"])
+        cooldown.set_ideation_attempt_head(state, "/repo/a", "deadbeef")
+        cooldown.clear_ideation_attempt_head(state, "/repo/a")
+        entry = cooldown.get_repo_entry(state, "/repo/a")
+        self.assertIsNone(cooldown.get_ideation_attempt_head(state, "/repo/a"))
+        self.assertNotIn("ideationAttemptedAt", entry)
+        self.assertEqual(cooldown.get_clean_baseline(state, "/repo/a"), "basehead")
+        self.assertIsNotNone(cooldown.get_last_stash(state, "/repo/a"))
+
+    def test_clear_on_a_never_seen_repo_is_a_noop(self) -> None:
+        state = cooldown.load_state(Path("/nonexistent"))
+        cooldown.clear_ideation_attempt_head(state, "/repo/never-seen")
+        self.assertEqual(state.get("repos", {}), {})
+
+    def test_clear_is_idempotent(self) -> None:
+        state = cooldown.load_state(Path("/nonexistent"))
+        cooldown.set_ideation_attempt_head(state, "/repo/a", "deadbeef")
+        for _ in range(3):
+            cooldown.clear_ideation_attempt_head(state, "/repo/a")
+        self.assertIsNone(cooldown.get_ideation_attempt_head(state, "/repo/a"))
+
+    def test_partial_state_with_only_a_timestamp_reads_as_none(self) -> None:
+        """Hand-edited / older state.json: the timestamp without the head must not be mistaken
+        for a booked attempt (that would terminate a research crawl at every HEAD).
+        """
+        state = cooldown.load_state(Path("/nonexistent"))
+        state.setdefault("repos", {})["/repo/a"] = {"ideationAttemptedAt": "2026-07-26T00:00:00+00:00"}
+        self.assertIsNone(cooldown.get_ideation_attempt_head(state, "/repo/a"))
+
+    def test_state_without_a_repos_table_at_all_still_reads_and_clears(self) -> None:
+        state = {"schemaVersion": 1, "seats": {}}  # a pre-`repos` state.json
+        self.assertIsNone(cooldown.get_ideation_attempt_head(state, "/repo/a"))
+        cooldown.clear_ideation_attempt_head(state, "/repo/a")  # must not raise
+        cooldown.set_ideation_attempt_head(state, "/repo/a", "deadbeef")
+        self.assertEqual(cooldown.get_ideation_attempt_head(state, "/repo/a"), "deadbeef")
+
+    def test_path_and_string_repo_keys_are_interchangeable(self) -> None:
+        """`gadkit.triage()` passes a `Path` while other call sites pass strings — a key mismatch
+        would silently hand out an unlimited number of refills.
+        """
+        state = cooldown.load_state(Path("/nonexistent"))
+        cooldown.set_ideation_attempt_head(state, Path("/repo/a"), "deadbeef")
+        self.assertEqual(cooldown.get_ideation_attempt_head(state, "/repo/a"), "deadbeef")
+        cooldown.clear_ideation_attempt_head(state, Path("/repo/a"))
+        self.assertIsNone(cooldown.get_ideation_attempt_head(state, "/repo/a"))
+
+    def test_attempts_are_tracked_per_repo(self) -> None:
+        state = cooldown.load_state(Path("/nonexistent"))
+        cooldown.set_ideation_attempt_head(state, "/repo/a", "aaa")
+        self.assertIsNone(cooldown.get_ideation_attempt_head(state, "/repo/b"))
+        cooldown.clear_ideation_attempt_head(state, "/repo/b")
+        self.assertEqual(cooldown.get_ideation_attempt_head(state, "/repo/a"), "aaa")
+
+    def test_marker_survives_the_state_file_round_trip(self) -> None:
+        state = cooldown.load_state(Path("/nonexistent"))
+        cooldown.set_ideation_attempt_head(state, "/repo/a", "deadbeef")
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            cooldown.save_state(state_path, state)
+            reloaded = cooldown.load_state(state_path)
+        self.assertEqual(cooldown.get_ideation_attempt_head(reloaded, "/repo/a"), "deadbeef")
 
 
 if __name__ == "__main__":

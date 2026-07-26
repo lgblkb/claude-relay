@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import http.client
 import json
 import time
 import urllib.error
@@ -87,6 +88,16 @@ class UsageFetchError(UsageError):
     def __init__(self, message: str, *, status_code: int | None = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+def is_auth_error(exc: UsageError) -> bool:
+    """True if `exc` means the token was rejected (HTTP 401) — distinct from a network blip or
+    rate limit. Such a seat is NOT permanently dead: a `claude` launch refreshes its token
+    (runner.py's module docstring, confirmed live). Moved here (B8 audit fix, 2026-07-26) from
+    `monitor.py`, which had the only copy, so `pick_seat()` can share the exact same predicate
+    rather than re-deriving it or reaching into another module's private helper.
+    """
+    return isinstance(exc, UsageFetchError) and exc.status_code == 401
 
 
 @dataclasses.dataclass(frozen=True)
@@ -319,6 +330,15 @@ def fetch_usage(seat_dir: Path, timeout: float = DEFAULT_TIMEOUT_S) -> UsageSnap
         ) from exc
     except urllib.error.URLError as exc:
         raise UsageFetchError(f"network error reaching usage endpoint: {exc.reason}") from exc
+    except (OSError, http.client.HTTPException) as exc:
+        # B7 audit fix: `urlopen()` wraps CONNECT-phase failures as URLError, but a failure
+        # during the READ phase (after the connection is already established — a mid-stream RST,
+        # a read timeout, a malformed status line) can arrive as a raw `TimeoutError`,
+        # `ConnectionResetError`, or `http.client.BadStatusLine` instead, which is NOT a
+        # `URLError` subclass and previously escaped every "never raises" handler here — one
+        # middlebox RST would have killed a multi-day run (Invariant #3: this function may raise
+        # only the three documented exception types, never anything else).
+        raise UsageFetchError(f"network error reaching usage endpoint: {exc}") from exc
     finally:
         del token  # best-effort: drop the only local reference promptly
 
@@ -336,6 +356,17 @@ class _CacheEntry:
     snapshot: UsageSnapshot
     cached_at: float
     extra_ttl_s: float = 0.0  # bump when we honor a Retry-After
+
+
+# B11 audit fix: `extra_ttl_s` accumulates on every consecutive 429 WITHOUT `cached_at` ever
+# being refreshed, so a long rate-limited streak (each extension adding its own Retry-After on
+# top of the last) measured 11.1h of staleness in one reproduction — the cache kept calling an
+# hours-old reading "fresh" the whole time. Bounding it here caps how stale a served reading can
+# ever become regardless of how many consecutive 429s occur, independent of the accumulation
+# formula itself. 30 minutes is chosen as "long enough to ride out a real rate-limit backoff
+# without re-hammering the endpoint every poll_ttl," short enough that a usage percent this old
+# is still a reasonable (if imperfect) basis for a rotation decision.
+_MAX_EXTRA_TTL_S = 1800.0
 
 
 class UsageCache:
@@ -374,7 +405,7 @@ class UsageCache:
             snapshot = fetch_usage(seat_dir, timeout=timeout)
         except RateLimited as exc:
             if entry is not None:
-                entry.extra_ttl_s += exc.retry_after_s or ttl
+                entry.extra_ttl_s = min(entry.extra_ttl_s + (exc.retry_after_s or ttl), _MAX_EXTRA_TTL_S)
                 return entry.snapshot
             raise
 

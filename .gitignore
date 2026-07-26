@@ -19,3 +19,7 @@ state.json
 
 # Stray gad-kit build artifacts (incomplete generation scaffolding, not real history).
 .gad/
+
+# uv ephemeral lockfile (created by `uv run --with pytest`); this project is stdlib-only
+# and declares no runtime dependencies to pin.
+uv.lock

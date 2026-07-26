@@ -177,6 +177,26 @@ class RenderTests(unittest.TestCase):
     def test_empty_rows_render_a_hint(self) -> None:
         self.assertIn("no seats", monitor.render_seat_table([], now=NOW))
 
+    def test_supervisor_running_renders_pid(self) -> None:
+        text = monitor.render_seat_table([], now=NOW, supervisor=(True, 4242))
+        self.assertIn("RUNNING (pid 4242)", text)
+        self.assertNotIn("NOT RUNNING", text)
+
+    def test_supervisor_dead_pid_renders_not_running(self) -> None:
+        text = monitor.render_seat_table([], now=NOW, supervisor=(False, 4242))
+        self.assertIn("NOT RUNNING", text)
+        self.assertIn("4242", text)
+
+    def test_supervisor_no_lockfile_renders_not_running_with_no_pid(self) -> None:
+        text = monitor.render_seat_table([], now=NOW, supervisor=(False, None))
+        self.assertIn("NOT RUNNING", text)
+        self.assertIn("no lockfile", text)
+
+    def test_no_supervisor_arg_omits_the_header_line_entirely(self) -> None:
+        """Backward compatible: omitting `supervisor=` must not print anything about it."""
+        text = monitor.render_seat_table([], now=NOW)
+        self.assertNotIn("supervisor:", text)
+
     def test_repo_status_reads_git_and_build_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -189,6 +209,57 @@ class RenderTests(unittest.TestCase):
 
     def test_repo_status_without_repo(self) -> None:
         self.assertIn("no repo configured", monitor.render_repo_status(None, now=NOW))
+
+
+class SupervisorLivenessTests(unittest.TestCase):
+    """B24 audit fix: the monitor must be able to distinguish "supervisor running" from "died
+    hours ago" by actually reading the lockfile's `pid:starttime`, not by inferring health from
+    run-log mtimes (which persist forever)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.config = Config(state_dir=Path(self._tmp.name))
+
+    def _lock_path(self) -> Path:
+        return self.config.state_dir / "claude-relay.lock"
+
+    def test_no_lockfile_is_not_running_with_no_pid(self) -> None:
+        self.assertEqual(monitor.supervisor_liveness(self.config), (False, None))
+
+    def test_own_live_pid_with_matching_starttime_is_running(self) -> None:
+        my_pid = os.getpid()
+        from relay import loop as loop_mod
+
+        starttime = loop_mod._proc_start_time(my_pid)
+        self._lock_path().write_text(f"{my_pid}:{starttime if starttime is not None else ''}")
+        is_alive, pid = monitor.supervisor_liveness(self.config)
+        self.assertTrue(is_alive)
+        self.assertEqual(pid, my_pid)
+
+    def test_a_dead_pid_is_not_running(self) -> None:
+        for candidate in (999999, 999998, 999997, 899999):
+            try:
+                os.kill(candidate, 0)
+            except ProcessLookupError:
+                dead_pid = candidate
+                break
+            except PermissionError:  # pragma: no cover - exists but not ours; try the next one
+                continue
+        else:
+            self.skipTest("could not find an unused PID to simulate a dead process")
+        self._lock_path().write_text(f"{dead_pid}:12345")
+        self.assertEqual(monitor.supervisor_liveness(self.config), (False, dead_pid))
+
+    def test_a_reused_pid_with_a_mismatched_starttime_is_not_running(self) -> None:
+        """The exact PID-reuse false-positive `_proc_start_time` corroboration exists to catch:
+        our own PID is genuinely alive, but the recorded starttime does not match — meaning the
+        lockfile's process has since exited and the OS handed this PID to someone else."""
+        my_pid = os.getpid()
+        self._lock_path().write_text(f"{my_pid}:1")  # implausible starttime — not really ours
+        is_alive, pid = monitor.supervisor_liveness(self.config)
+        self.assertFalse(is_alive)
+        self.assertEqual(pid, my_pid)
 
 
 class LatestRunSeatTests(unittest.TestCase):
