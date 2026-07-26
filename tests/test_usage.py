@@ -5,8 +5,12 @@ No network calls — usage.fetch_usage is monkeypatched wherever a live GET woul
 from __future__ import annotations
 
 import datetime as dt
+import http.client
+import json
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from relay import usage
@@ -198,6 +202,67 @@ class UsageCacheTests(unittest.TestCase):
         with mock.patch.object(usage, "fetch_usage", side_effect=usage.RateLimited(30.0)):
             with self.assertRaises(usage.RateLimited):
                 cache.poll("dummy-seat-dir", ttl=90, now=1000.0)
+
+    def test_b11_extra_ttl_s_is_bounded_across_many_consecutive_429s(self) -> None:
+        """B11: `extra_ttl_s` used to accumulate `retry_after_s` (or `ttl`) on EVERY consecutive
+        429 with no ceiling — a long enough streak measured 11.1h of staleness in one
+        reproduction, since `cached_at` is never refreshed when extending. Bounding it caps how
+        stale a served reading can ever become regardless of how many 429s occur in a row.
+        """
+        cache = usage.UsageCache()
+        snapshot = usage.UsageSnapshot.from_json(_usage_json(), fetched_at=1000.0)
+        # A long streak of 429s, each honoring a generous Retry-After. `now` advances well past
+        # whatever the CURRENT effective TTL is each time, so every call actually re-attempts a
+        # fetch (and hits the next RateLimited) rather than being served straight from cache —
+        # `cached_at` itself never moves, which is the non-refreshing accumulation bug.
+        with mock.patch.object(
+            usage,
+            "fetch_usage",
+            side_effect=[snapshot] + [usage.RateLimited(600.0)] * 20,
+        ):
+            cache.poll("dummy-seat-dir", ttl=90, now=1000.0)
+            for i in range(1, 21):
+                cache.poll("dummy-seat-dir", ttl=90, now=1000.0 + i * 5000.0)
+        entry = cache._entries["dummy-seat-dir"]
+        self.assertLessEqual(entry.extra_ttl_s, usage._MAX_EXTRA_TTL_S)
+        # 20 * 600s = 12000s unbounded vs. the ~1800s cap — the bound must actually be binding
+        # for this fixture, not just coincidentally under some huge accumulated value.
+        self.assertEqual(entry.extra_ttl_s, usage._MAX_EXTRA_TTL_S)
+
+
+class B7FetchUsageReadPhaseNetworkExceptionTests(unittest.TestCase):
+    """B7 audit fix: `fetch_usage()`'s documented contract is "raises NeedsLoginError,
+    RateLimited, or UsageFetchError — never anything else." A read-phase failure (after the
+    connection succeeded — a mid-stream RST, a read timeout, a malformed HTTP status line) used
+    to arrive as a raw `OSError` subclass or `http.client.HTTPException`, escaping that contract
+    entirely and, via `loop.run()`'s exception-less `try/finally`, killing a multi-day run.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.seat_dir = Path(self._tmp.name) / "seat"
+        self.seat_dir.mkdir()
+        (self.seat_dir / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "fake-token"}}), encoding="utf-8"
+        )
+
+    def _assert_wrapped_as_usage_fetch_error(self, exc: BaseException) -> None:
+        with mock.patch.object(usage.urllib.request, "urlopen", side_effect=exc):
+            with self.assertRaises(usage.UsageFetchError) as ctx:
+                usage.fetch_usage(self.seat_dir)
+        # Must not be some OTHER exception type re-raised bare — assert the contract's promise
+        # explicitly, not just "some exception happened."
+        self.assertNotIsInstance(ctx.exception, usage.RateLimited)
+
+    def test_connection_reset_is_wrapped_as_usage_fetch_error(self) -> None:
+        self._assert_wrapped_as_usage_fetch_error(ConnectionResetError("rst"))
+
+    def test_bare_timeout_is_wrapped_as_usage_fetch_error(self) -> None:
+        self._assert_wrapped_as_usage_fetch_error(TimeoutError("timed out"))
+
+    def test_bad_status_line_is_wrapped_as_usage_fetch_error(self) -> None:
+        self._assert_wrapped_as_usage_fetch_error(http.client.BadStatusLine("garbage"))
 
 
 if __name__ == "__main__":

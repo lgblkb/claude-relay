@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import tempfile
 import unittest
 from pathlib import Path
@@ -114,9 +115,114 @@ class LoadConfigTests(unittest.TestCase):
         with self.assertRaises(config_mod.ConfigError):
             config_mod.load_config(path)
 
+    def test_stale_gadkit_extra_flags_key_loads_without_error_and_is_not_exposed(self) -> None:
+        """`[gadkit].extra_flags` was removed (it was dead config: populated onto `Plan` and never
+        read by `gadkit.command()`, and it could not have worked as documented anyway — command()
+        builds a JSON args OBJECT, not a CLI flag list). An operator's stale config.toml must
+        still load: crashing on a leftover key would take the supervisor down, not the key.
+        """
+        path = self.tmp_dir / "config.toml"
+        path.write_text(
+            "[gadkit]\n"
+            'tier = "balanced"\n'
+            'extra_flags = ["--milestone", "--skip-premortem"]\n',
+            encoding="utf-8",
+        )
+        cfg = config_mod.load_config(path)
+        self.assertEqual(cfg.gadkit_tier, "balanced")  # the surviving key still parses
+        self.assertFalse(hasattr(cfg, "gadkit_extra_flags"))
+        self.assertNotIn(
+            "extra_flags", {f.name for f in dataclasses.fields(config_mod.Config)}
+        )
+        self.assertNotIn(
+            "gadkit_extra_flags", {f.name for f in dataclasses.fields(config_mod.Config)}
+        )
+
+    def test_stale_extra_flags_of_any_shape_is_ignored_rather_than_validated(self) -> None:
+        # Not a list, and alongside other unknown keys — none of it may raise.
+        path = self.tmp_dir / "config.toml"
+        path.write_text(
+            '[gadkit]\nextra_flags = "--milestone"\nsome_future_key = 3\n', encoding="utf-8"
+        )
+        cfg = config_mod.load_config(path)
+        self.assertEqual(cfg.gadkit_tier, "budget")
+
     def test_default_paths_are_derived_from_home_not_hardcoded(self) -> None:
         state_dir = config_mod.default_state_dir()
         self.assertEqual(state_dir, Path.home() / ".claude-relay")
+
+
+class NumericValidationTests(unittest.TestCase):
+    """B30 audit fix: numeric config values are now sanity-checked at load time — a bad value
+    must fail loudly as a `ConfigError`, not silently wreck unattended operation later.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp_dir = Path(self._tmp.name)
+
+    def _load(self, toml_body: str) -> config_mod.Config:
+        path = self.tmp_dir / "config.toml"
+        path.write_text(toml_body, encoding="utf-8")
+        return config_mod.load_config(path)
+
+    def test_zero_run_timeout_s_is_rejected(self) -> None:
+        """The exact B30 reproduction: `run_timeout_s = 0` would otherwise make every run
+        instantly "time out" and burn the fleet into repeated cooldowns doing zero work."""
+        with self.assertRaises(config_mod.ConfigError):
+            self._load("run_timeout_s = 0\n")
+
+    def test_negative_run_timeout_s_is_rejected(self) -> None:
+        with self.assertRaises(config_mod.ConfigError):
+            self._load("run_timeout_s = -5\n")
+
+    def test_zero_poll_ttl_is_rejected(self) -> None:
+        with self.assertRaises(config_mod.ConfigError):
+            self._load("poll_ttl = 0\n")
+
+    def test_negative_max_units_is_rejected(self) -> None:
+        with self.assertRaises(config_mod.ConfigError):
+            self._load("max_units = -1\n")
+
+    def test_start_margin_exceeding_ceiling_pct_is_rejected(self) -> None:
+        """The exact B30 reproduction: `start_margin > ceiling_pct` makes `start_cap` negative,
+        so `pick_seat()` could never select ANY seat — a silent, permanent B2-style stall."""
+        with self.assertRaises(config_mod.ConfigError):
+            self._load("[defaults]\nceiling_pct = 70\nstart_margin = 80\n")
+
+    def test_start_margin_equal_to_ceiling_pct_is_also_rejected(self) -> None:
+        """The boundary case: start_cap would be exactly zero, still unsatisfiable by any real
+        (non-negative) percent."""
+        with self.assertRaises(config_mod.ConfigError):
+            self._load("[defaults]\nceiling_pct = 70\nstart_margin = 70\n")
+
+    def test_ceiling_pct_out_of_range_is_rejected(self) -> None:
+        with self.assertRaises(config_mod.ConfigError):
+            self._load("[defaults]\nceiling_pct = 150\n")
+
+    def test_negative_start_margin_is_rejected(self) -> None:
+        with self.assertRaises(config_mod.ConfigError):
+            self._load("[defaults]\nstart_margin = -5\n")
+
+    def test_per_seat_ceiling_out_of_range_is_rejected(self) -> None:
+        with self.assertRaises(config_mod.ConfigError):
+            self._load("[seats.sam]\nceiling_pct = 0\n")
+
+    def test_non_numeric_run_timeout_s_raises_config_error_not_a_bare_value_error(self) -> None:
+        """The OTHER half of B30: a malformed (wrong-type) numeric TOML value used to raise a
+        bare `ValueError` straight out of `load_config()` instead of the `ConfigError` every
+        other config problem in this module raises."""
+        with self.assertRaises(config_mod.ConfigError):
+            self._load('run_timeout_s = "not a number"\n')
+
+    def test_cli_ceiling_override_out_of_range_is_rejected(self) -> None:
+        with self.assertRaises(config_mod.ConfigError):
+            config_mod.load_config(self.tmp_dir / "missing.toml", ceiling_overrides={"sam": 0.0})
+
+    def test_a_valid_config_still_loads_cleanly(self) -> None:
+        cfg = self._load("run_timeout_s = 3600\n[defaults]\nceiling_pct = 70\nstart_margin = 5\n")
+        self.assertEqual(cfg.run_timeout_s, 3600.0)
 
 
 if __name__ == "__main__":

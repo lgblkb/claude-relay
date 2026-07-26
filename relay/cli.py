@@ -224,6 +224,22 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         )
         return 1
     print(f"resolved {args.decision_id!r} in {result.index_path}: {result.decision}")
+    if not result.committed:
+        # B13 audit fix, second round: the resolution itself DID apply (the JSON write already
+        # succeeded and is what `blocking_decisions()` reads — the repo IS unblocked right now),
+        # but its own commit failed (a rejecting pre-commit hook, or no git identity configured
+        # in {repo}). Loud, not silent: a failure here must never read as an ordinary clean
+        # resolution. `triage()` will not sweep this specific uncommitted change into a stash
+        # (it is exempted), and will retry committing it on every future cycle — but committing
+        # it by hand now removes any doubt.
+        print(
+            f"WARNING: the resolution was applied to disk but its own git commit FAILED "
+            f"(check for a rejecting pre-commit hook, or missing git user.name/user.email, in "
+            f"{repo}). The repo is unblocked already, and claude-relay will keep retrying the "
+            f"commit automatically — but you should commit {result.index_path} by hand to be "
+            "safe.",
+            file=sys.stderr,
+        )
     return 0
 
 

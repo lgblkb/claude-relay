@@ -1,14 +1,20 @@
-"""Offline tests for relay.cli: the argument parser wiring and `claude-relay init` (config
-seeding for pipx/uv installs). HOME is redirected to a temp dir so nothing touches the real
-~/.claude-relay. No network, no subprocesses.
+"""Offline tests for relay.cli: the argument parser wiring, `claude-relay init` (config seeding
+for pipx/uv installs), and `claude-relay resolve` (the B13 commit-failure surfacing). HOME is
+redirected to a temp dir so nothing touches the real ~/.claude-relay. No network. `ResolveCommand
+Tests` spawns real local `git` subprocesses (no network) against throwaway temp repos, mirroring
+`tests/test_gadkit.py`'s convention.
 """
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import stat
+import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -170,6 +176,68 @@ class InitTests(unittest.TestCase):
             cfg_path.write_text('repo = "/edited/by/user"\n', encoding="utf-8")
             self._run_init(home, force=True)
             self.assertNotIn("/edited/by/user", cfg_path.read_text(encoding="utf-8"))
+
+
+def _run_git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=str(repo), check=True, capture_output=True, text=True)
+
+
+def _init_gad_repo(repo: Path, decision_id: str = "D1") -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    _run_git(repo, "init", "-q")
+    _run_git(repo, "config", "user.email", "test@example.com")
+    _run_git(repo, "config", "user.name", "Test")
+    gad = repo / ".gad"
+    gad.mkdir()
+    index = {
+        "project": "t",
+        "nextGen": 1,
+        "generations": [],
+        "ownerDecisions": [{"id": decision_id, "question": "pick a DB", "blocksGen": 1, "status": "open"}],
+    }
+    (gad / "generations-index.json").write_text(json.dumps(index, indent=2), encoding="utf-8")
+    _run_git(repo, "add", "-A")
+    _run_git(repo, "commit", "-q", "-m", "seed .gad state")
+
+
+class ResolveCommandTests(unittest.TestCase):
+    """B13 audit fix, second round: `claude-relay resolve` must never report an uncommitted
+    resolution (a rejecting pre-commit hook, an unset git identity) as an ordinary clean
+    success — this drives the REAL `cmd_resolve` against a real repo, not a mock of
+    `resolve_owner_decision`.
+    """
+
+    def _resolve(self, home: Path, repo: Path) -> tuple[int, str]:
+        args = cli.build_parser().parse_args(["resolve", "D1", "use postgres"])
+        args.repo = str(repo)
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False), redirect_stderr(buf):
+            rc = cli.cmd_resolve(args)
+        return rc, buf.getvalue()
+
+    def test_a_clean_resolution_prints_no_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            repo = Path(tmp) / "repo"
+            _init_gad_repo(repo)
+            rc, stderr = self._resolve(home, repo)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("WARNING", stderr)
+
+    def test_a_failed_commit_prints_a_loud_warning_and_still_reports_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            repo = Path(tmp) / "repo"
+            _init_gad_repo(repo)
+            hooks_dir = repo / ".git" / "hooks"
+            hook = hooks_dir / "pre-commit"
+            hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            hook.chmod(hook.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+            rc, stderr = self._resolve(home, repo)
+        # The resolution DID apply on disk — this is not a "not found"/failure return code.
+        self.assertEqual(rc, 0)
+        self.assertIn("WARNING", stderr)
+        self.assertIn("FAILED", stderr)
 
 
 if __name__ == "__main__":

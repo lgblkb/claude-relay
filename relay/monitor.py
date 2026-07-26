@@ -34,7 +34,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TextIO
 
-from relay import cooldown, fleet
+from relay import cooldown, fleet, loop
 from relay import usage as usage_mod
 from relay.config import Config
 
@@ -80,16 +80,54 @@ def _max_weekly_percent(usage: usage_mod.UsageSnapshot) -> float | None:
 
 
 def _is_auth_error(exc: usage_mod.UsageError) -> bool:
-    """True if a live poll failed because the token was rejected (HTTP 401) — distinct from a
-    network blip. Such a seat is NOT permanently dead: a `claude` launch refreshes its token.
+    """Thin re-export: the shared predicate now lives in `usage.is_auth_error()` (B8 audit fix)
+    so `loop.pick_seat()` can use the exact same logic — kept here under its original name so
+    every existing call site in this module is unchanged.
     """
-    return isinstance(exc, usage_mod.UsageFetchError) and exc.status_code == 401
+    return usage_mod.is_auth_error(exc)
+
+
+def supervisor_liveness(config: Config) -> tuple[bool, int | None]:
+    """`(is_alive, pid)` for the supervisor (`claude-relay run`) process, read-only — this
+    module NEVER acquires the lock, only inspects it, using the SAME pid+starttime corroboration
+    `SingleInstanceLock._is_stale()` applies internally rather than a bare `os.kill(pid, 0)`
+    (which PID reuse can fool).
+
+    B24 audit fix: the monitor's only liveness-adjacent signal used to be `latest_run_seat()`'s
+    run-log mtime, which persists forever after a crash — a supervisor dead for hours renders
+    IDENTICALLY to a healthy one (the same "← latest run" label, forever). Combined with B12 (an
+    uncaught exception used to exit with zero notification), the operator had no signal at all
+    that supervision had stopped. Returns `(False, None)` if no lockfile exists (never started,
+    or a clean shutdown that released it) — that is a legitimate "not running," not an error.
+    """
+    lock_path = config.state_dir / "claude-relay.lock"
+    lock = loop.SingleInstanceLock(lock_path)
+    pid, recorded_starttime = lock._read_lock_contents()
+    if pid is None:
+        return False, None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False, pid
+    except PermissionError:
+        return True, pid  # alive, just owned by someone else — can't corroborate further
+    except OSError:  # pragma: no cover - platform without signal 0 support
+        return False, pid
+    if recorded_starttime is not None:
+        current_starttime = loop._proc_start_time(pid)
+        if current_starttime is not None and current_starttime != recorded_starttime:
+            return False, pid  # PID reused by an unrelated process — the recorded one is dead
+    return True, pid
 
 
 def latest_run_seat(log_dir: Path) -> str | None:
     """The seat name of the most recent `run-<stamp>-<seat>.log` under `log_dir` — a best-effort
     "which seat is (or just was) running" marker, since the monitor is observe-only and has no
     other channel to the loop. Returns None if `log_dir` has no run logs yet.
+
+    B24 audit fix note: this is a "most recent activity" marker, NOT a liveness signal — its
+    underlying mtime persists forever after a crash. Use `supervisor_liveness()` for "is the
+    supervisor actually still running right now."
     """
     newest = _newest_run_log(log_dir)
     if newest is None:
@@ -244,12 +282,31 @@ def _source_cell(row: SeatRow) -> str:
     return "—"
 
 
-def render_seat_table(rows: Sequence[SeatRow], *, now: dt.datetime | None = None) -> str:
-    """Render the seat table as plain text (theme-agnostic, terminal-safe). Pure — no I/O."""
+def render_seat_table(
+    rows: Sequence[SeatRow],
+    *,
+    now: dt.datetime | None = None,
+    supervisor: tuple[bool, int | None] | None = None,
+) -> str:
+    """Render the seat table as plain text (theme-agnostic, terminal-safe). Pure — no I/O.
+
+    `supervisor` (when given — `supervisor_liveness()`'s return value) renders an explicit
+    RUNNING/NOT RUNNING header line (B24 audit fix) so a dead supervisor cannot render
+    identically to a healthy one just because the seat rows themselves still look plausible.
+    """
     now = now or dt.datetime.now(dt.UTC)
     header = f"claude-relay · seats · {now.strftime('%H:%M:%SZ')}"
+    lines = [header]
+    if supervisor is not None:
+        is_alive, pid = supervisor
+        if is_alive:
+            lines.append(f"supervisor: RUNNING (pid {pid})")
+        elif pid is not None:
+            lines.append(f"supervisor: NOT RUNNING — last known pid {pid} is dead")
+        else:
+            lines.append("supervisor: NOT RUNNING — no lockfile found")
     cols = f"{'SEAT':<8} {'5H%':>4} {'':10} {'RESET':>7} {'WEEK':>5} {'STATE':<14} SRC"
-    lines = [header, "─" * len(cols), cols]
+    lines += ["─" * len(cols), cols]
     if not rows:
         lines.append("(no seats discovered — looked for ~/.claude-* dirs)")
     for row in rows:
@@ -293,7 +350,8 @@ def run_seats_panel(
         while True:
             state = cooldown.load_state(config.state_path)
             rows = build_seat_rows(config, state, cache, log_dir=config.log_dir)
-            _emit(out, render_seat_table(rows), clear=not once)
+            supervisor = supervisor_liveness(config)
+            _emit(out, render_seat_table(rows, supervisor=supervisor), clear=not once)
             if once:
                 return
             time.sleep(interval)

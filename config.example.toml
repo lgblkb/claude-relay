@@ -17,9 +17,12 @@ exclude = ["yerasyl"]
 # How long (seconds) a usage reading is trusted before re-polling the same seat.
 poll_ttl = 90
 
-# Free-text directive appended to the `/gad-run` prompt so a long generation doesn't die on an
-# undocumented per-turn ceiling. Its exact effect is unverified until the first real run (see
-# gadkit.py's `command()` docstring and this generation's uncertainty-ledger.jsonl).
+# Free-text directive appended to the `/gad-run` prompt, intended to tell gad-run.js a token
+# budget for the turn. VERIFIED (2026-07-26 audit) to currently have NO EFFECT: the installed
+# `claude` CLI bundle never populates the `budget.total` field gad-run.js reads to self-pace, so
+# this text is inert prompt-only content regardless of phrasing. Kept as a config knob (a future
+# CLI version may wire it up, and it is harmless either way) but do not rely on it as a real
+# pacing mechanism — `--max 1` (always used in Phase 1) is what actually bounds each invocation.
 token_target = "+2M"
 
 # Phase 2 batching knob (`--max N`); unused in Phase 1, which always runs `--max 1`. Also used
@@ -67,9 +70,10 @@ adopt_default = "always"
 # calls the same concept a "tier" internally to avoid the config-name collision (see
 # DESIGN.md's header and gadkit.py's module docstring).
 tier = "budget"
-# Extra tokens appended verbatim to the end of every /gad-run, /gad-generation, and
-# /gad-finish prompt this tool builds (e.g. ["--milestone"] or ["--skip-premortem"]).
-extra_flags = []
+# There is deliberately no `extra_flags` key (removed 2026-07-26): it was never read, and the
+# things it advertised are workflow-args KEYS (milestone / skipPreMortem), not CLI flag strings —
+# claude-relay hands gad-kit a `Workflow({scriptPath, args})` JSON object, not a slash command.
+# See relay/config.py's [gadkit] comment.
 
 [plugins]
 # OPT-IN plugins exposed to EVERY headless run on EVERY seat, via `claude --plugin-dir <root>`.

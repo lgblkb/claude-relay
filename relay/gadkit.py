@@ -19,20 +19,68 @@ phase death to `/gad-finish` risks committing a generation with no tests.
 v1 gated FINISH-safety on a path-pattern heuristic ("does some dirty path look like a test
 file"), which both reviewers broke: a Prep-phase fixture under `tests/` (test-writer hasn't
 even run yet) or a coincidentally `test_`-named file anywhere in the repo satisfied the
-heuristic and wrongly proved "Guardrails ran." Fixed: `triage()` now gates FINISH on ONE
-genuine Verify-or-later artifact — `.gad/generation-N/reviews/verification.md` — which is
-written ONLY by the Verify-phase verifier agent (gad-generation.js's `phase('Verify')` block:
-"Write ${DIR}/reviews/verification.md"), and Verify can only ever start after Guardrails'
-test-writer returned non-null (a null test-writer result makes gad-generation.js
-`deadAgentAbort('Guardrails/test-writer')` and `return` immediately, before `phase('Verify')`
-ever runs). So this file's mere presence is disk-visible proof Guardrails already completed,
-regardless of what test paths happen to be dirty. If this file is absent, `triage()` ALWAYS
-defaults to a full `/gad-generation` restart (never FINISH) — a redundant restart is safe; a
-testless commit is not. Recovery also non-destructively parks the partial tree with
-`git stash` (Invariant #6 — never `git reset --hard` unrelated work, and never even stash
-unless (a) the dirtiness is scoped to a `git HEAD` claude-relay itself last saw this repo
-clean at, AND (b) the dirty set shows a `.gad/`/`generation-N/` signal consistent with an
-in-progress generation).
+heuristic and wrongly proved "Guardrails ran." Fixed: `triage()` now gates FINISH on TWO
+genuine Verify-or-later artifacts — `.gad/generation-N/reviews/verification.md` (written ONLY
+by the Verify-phase verifier agent, gad-generation.js's `phase('Verify')` block: "Write
+${DIR}/reviews/verification.md") AND `.gad/generation-N/reviews/adversarial-review.md`.
+
+The SAFETY PROPERTY `verification.md` alone buys (gad-kit 2.0, which no longer has a single
+mandatory Guardrails agent): whichever agent Guardrails hard-requires for this generation's
+`genType` MUST have returned non-null before `phase('Verify')` can run at all, because every
+Guardrails branch aborts-and-returns on a null result *before* Verify:
+  - `genType: 'ideation'` — the results-skeptic's ideation vet IS the guardrail (there is no
+    test-writer, since ideation ships no code): `if (vet === null) return
+    deadAgentAbort('Guardrails/skeptic-vet')`.
+  - every other genType (`build`/`experiment`/`eda`) — the test-writer is the hard requirement:
+    `if (!guardrails || guardrails[0] === null) return deadAgentAbort('Guardrails/test-writer')`.
+
+REFUSED-status regression fix (2026-07-26, gad-kit's uncommitted 2.1.0 work): `verification.md`
+alone turned out NOT to be sufficient, because the adversarial-reviewer/results-skeptic
+component of Guardrails is only ADVISORY for non-ideation genTypes — if it dies after retries,
+gad-generation.js logs "proceeding without an adversarial review this generation (the verifier
++ gate remain the backstop)" and still runs Verify, still writing verification.md. So
+"verification.md present, adversarial-review.md absent" is an ORDINARY, gad-kit-sanctioned
+committed state — but NOT a safe FINISH target for an interrupted generation, because
+gad-finish.js's own Verify prompt now MECHANICALLY REFUSES exactly this case (ship-blocker 2,
+same date): absent `adversarial-review.md` it sets `guardrailsArtifactMissing`, returns `status:
+'REFUSED'`, and writes NOTHING — the tail considers itself the wrong route for that generation.
+Routing to FINISH anyway wastes an invocation for nothing (worse: three, before HARD_ERROR, since
+`outcome()` reads "nothing committed" as `AGENT_DEAD_NONLIMIT` and the next `triage()` would
+propose the SAME refused FINISH again — nothing on disk changed). Requiring BOTH files can never
+reject a genuinely resumable ideation generation: ideation's hard-required guardrail call IS the
+one that writes adversarial-review.md, so the two files are never out of sync in that genType —
+only the non-ideation advisory-death gap is excluded, which is exactly the point.
+
+Either way the dangerous case this gate exists to prevent (a `/gad-finish` that commits or is
+attempted against a generation whose mandatory guardrail evidence is incomplete) is excluded. If
+either file is absent, `triage()` ALWAYS defaults to a full `/gad-generation` restart (never
+FINISH) — a redundant restart is safe; a testless/reviewless commit (or a wasted REFUSED
+invocation) is not. Recovery also non-destructively parks the partial tree with `git stash`
+(Invariant #6 — never `git reset --hard` unrelated work, and never even stash unless (a) the
+dirtiness is scoped to a `git HEAD` claude-relay itself last saw this repo clean at, AND (b) the
+dirty set shows a `.gad/`/`generation-N/` signal consistent with an in-progress generation).
+
+Which generation is "in flight" is ALSO disk evidence, not `index.nextGen` (2026-07-26 audit).
+`nextGen` is only advanced by a successful consolidation (gad-kit/agents/consolidator.md:91
+"...commit placeholder, set `nextGen`"), so it names *a* generation, not necessarily the one
+whose partial work is on disk. In gad-kit 2.0 the crawl no longer runs pending generations in
+gen order at all — gad-run.js:283 sorts them `priority DESC, then gen ASC`, and that sort is
+NOT gated on research mode, so it activates on any repo the moment one backlog entry carries a
+`Priority:` line. An out-of-order generation that is then interrupted leaves `nextGen` pointing
+at a DIFFERENT generation: the artifact census read the wrong `generation-N/`, concluded
+`verify_or_later=False`, and claude-relay stashed the in-flight generation's tree to "restart"
+an unrelated one. `in_flight_generation()` therefore derives it from the dirty set first and
+directory mtimes second, and falls back to `nextGen` only when disk says nothing at all — the
+ambiguous case keeps the pre-2.0 behaviour rather than guessing. Note the `git stash` gate
+itself (`_has_gad_dirty_signal`) no longer takes a generation number at all — it is satisfied
+ONLY by an actual dirty path under `.gad/` (2026-07-26 audit finding B10: a bare
+`generation_dir(repo, next_gen).exists()` clause used to satisfy it unconditionally the moment
+that scaffold directory existed on disk, regardless of whether anything under `.gad/` was
+actually dirty; reproduced with three unrelated operator files — two of them untracked — swept
+into a stash with zero `.gad/` paths in the dirty set. Removed rather than fixed-in-place, per
+the module's own docstring above, which always described the gate as "some changed path is
+under `.gad/`"). Widening *which* generation we recover (see the A5-fix note on `recovery_gen`
+in `triage()`) must never widen *when* we are willing to touch the tree at all (Invariant #6).
 """
 
 from __future__ import annotations
@@ -60,7 +108,43 @@ if TYPE_CHECKING:
 # it is surfaced to the human but never blocks the autonomous crawl).
 _OPEN_STATUS = "open"
 
+# The one status token gad-kit recognizes as unblocking. See `resolve_owner_decision()` for the
+# full defect writeup: gad-kit's open-decision predicate is an LLM-judged prompt string that says
+# 'status "open" (i.e. not "answered")' (gad-generation.js:443) / 'status "open"/not "answered"'
+# (gad-run.js:220), so any third value is undefined behaviour there.
+_ANSWERED_STATUS = "answered"
+
 _BACKLOG_HEADER_RE = re.compile(r"^##\s*G(\d+)\b", re.MULTILINE)
+
+# One backlog entry's declared generation type. Two on-disk renderings must both parse:
+# the research template writes a markdown bullet with bold key (`- **Type**: experiment`, e.g.
+# gad-kit/templates/backlog-research.md:39/47), while gad-run's survey prompt only ever asks the
+# agent for "its \"Type:\" line" (gad-kit/workflows/gad-run.js:218) — so a hand-written bare
+# `Type: experiment` is equally legitimate. Hence the optional bullet marker / `**` / backticks.
+_BACKLOG_TYPE_RE = re.compile(
+    r"^[ \t]*[-*]?[ \t]*\*{0,2}[ \t]*type[ \t]*\*{0,2}[ \t]*:[ \t]*`?([A-Za-z]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# The genType values gad-generation.js:124 actually accepts; anything else (including a literal
+# "build") coerces to 'build' there, which is also the no-argument default — so claude-relay
+# reports those as None and OMITS the key entirely, mirroring gad-run.js:350.
+_RESEARCH_GEN_TYPES = ("experiment", "eda", "ideation")
+
+# The load-bearing research-mode marker gad-run's survey looks for (gad-run.js:219), rendered as
+# an HTML comment by the research backlog template (templates/backlog-research.md:3).
+_RESEARCH_MODE_MARKER = "gad-mode: research"
+
+# A9 audit fix: `is_research_repo()` used to be a bare substring test over the WHOLE backlog, so
+# a build repo merely discussing "gad-mode: research" in prose (plausible in a research-flavoured
+# build backlog's own narrative) never terminated cleanly — it kept handing an exhausted backlog
+# to /gad-run's auto-ideation forever. Now the marker must appear inside an HTML comment, which is
+# the only form the template actually emits it in.
+_HTML_COMMENT_RE = re.compile(r"<!--(.*?)-->", re.DOTALL)
+
+# A `.gad/generation-<N>/...` path as `git status --porcelain` reports it (repo-relative, and a
+# wholly-new scaffold shows up as the single untracked entry `.gad/generation-7/`).
+_GEN_PATH_RE = re.compile(r"(?:^|/)\.gad/generation-(\d+)(?:/|$)")
 
 _REVIEW_FILENAMES = (
     "architecture-review.md",
@@ -91,6 +175,20 @@ class Plan:
     case — the loop's notify key includes it so a DIFFERENT decision blocking the same repo/gen
     always produces a fresh notification instead of being silently deduped by a stale key
     (finding #2: notification dedupe must not permanently swallow a changed condition).
+
+    `gen_type` carries the generation's declared gad-kit 2.0 `genType` (`experiment`/`eda`/
+    `ideation`, or None for the default `build`) on the two RECOVERY modes only. It is read from
+    the backlog by `backlog_gen_type()`; `command()` threads it into the workflow args exactly
+    like gad-run.js:350 does, omitting it whenever it is None.
+
+    `ideation_refill` is True ONLY for the one RUN plan `_exhausted_backlog_plan()` produces when
+    handing an exhausted RESEARCH backlog to `/gad-run` for auto-ideation — the plan that ALSO
+    books `cooldown.set_ideation_attempt_head()` at decision time. A6 audit fix: `run_once()`'s
+    no-seat early return must give that booking back (it was recorded but never actually spent),
+    but it must do so ONLY when THIS plan is the one that booked it — gating on "no seat was
+    found for a RUN/FINISH plan" alone (any plan) wiped a still-binding marker from an entirely
+    unrelated iteration (e.g. a mid-generation recovery restart), letting the same HEAD be
+    re-attempted for auto-ideation indefinitely once every no-seat iteration cleared it again.
     """
 
     kind: str  # "DONE" | "AWAITING_HUMAN" | "BLOCKED" | "RUN" | "FINISH"
@@ -100,9 +198,10 @@ class Plan:
     detail: str = ""
     tier: str = "budget"
     token_target: str = "+2M"
-    extra_flags: tuple[str, ...] = ()
+    gen_type: str | None = None  # gad-kit 2.0 genType; None == 'build' (the workflow default)
     stashed_ref: str | None = None
     blocking_decision_ids: tuple[str, ...] = ()
+    ideation_refill: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -223,16 +322,98 @@ def format_decisions_for_operator(decisions: list[dict[str, Any]], *, gen: int |
     return "\n".join(lines)
 
 
+def backlog_path(repo: Path) -> Path:
+    return Path(repo) / ".gad" / "backlog.md"
+
+
+def _read_backlog(repo: Path) -> str | None:
+    """The raw backlog text, or None if it is absent/unreadable. Every backlog reader below is
+    read-only and must tolerate a repo that is not GAD-bootstrapped at all.
+    """
+    path = backlog_path(repo)
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
 def backlog_generations(repo: Path) -> list[int]:
     """Generation numbers declared in `.gad/backlog.md` (headers of the form `## G<N> — ...`)."""
-    backlog_path = Path(repo) / ".gad" / "backlog.md"
-    if not backlog_path.exists():
-        return []
-    try:
-        text = backlog_path.read_text(encoding="utf-8")
-    except OSError:
+    text = _read_backlog(repo)
+    if text is None:
         return []
     return sorted({int(m.group(1)) for m in _BACKLOG_HEADER_RE.finditer(text)})
+
+
+def backlog_section(repo: Path, gen: int) -> str | None:
+    """The body of `.gad/backlog.md`'s `## G<gen>` entry — from just after its heading to the
+    start of the NEXT `## G<n>` heading (or EOF). Bounding matters: the research template puts a
+    per-entry *convention legend* (`- **Type**: \\`experiment\\` | \\`eda\\` | ...`,
+    templates/backlog-research.md:15) in the preamble ABOVE `## G0`, and an unbounded search
+    would read that legend as if it were G0's declared type. Returns None when the backlog is
+    missing/unreadable or declares no such generation.
+    """
+    text = _read_backlog(repo)
+    if text is None:
+        return None
+    headers = list(_BACKLOG_HEADER_RE.finditer(text))
+    for i, match in enumerate(headers):
+        if int(match.group(1)) != gen:
+            continue
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
+        return text[match.end() : end]
+    return None
+
+
+def backlog_gen_type(repo: Path, gen: int) -> str | None:
+    """The gad-kit 2.0 `genType` generation `gen` declares in the backlog, or None.
+
+    None means "pass no genType" — which is exactly right for `build`, for a missing/unrecognized
+    `Type:` line, and for an unreadable backlog, because gad-generation.js:124 and gad-finish.js:65
+    both coerce an absent/unknown `cfg.genType` to `'build'` with no error path. Returning the
+    value only for the three real research types mirrors gad-run.js:350's own
+    `g.genType && g.genType !== 'build'` omit-for-build behaviour.
+
+    Why claude-relay must read this at all: `RESEARCH = GEN_TYPE !== 'build'` switches the
+    planner/prep/implement/guardrail ROLES and, when false, empties `RESEARCH_VERIFY_NOTE` /
+    `RESEARCH_FIX_NOTE` — the two instructions that tell the verifier a rigorously refuted
+    hypothesis is CLEAN and forbid the fixer from re-rolling pre-registered seeds or relaxing a
+    ratchet floor. gad-run threads it per-generation from the backlog; claude-relay's two
+    RECOVERY paths (`/gad-generation` restart, `/gad-finish` tail) are the only callers that
+    would otherwise silently downgrade a research generation to a build generation.
+    """
+    section = backlog_section(repo, gen)
+    if section is None:
+        return None
+    match = _BACKLOG_TYPE_RE.search(section)
+    if match is None:
+        return None
+    value = match.group(1).strip().lower()
+    return value if value in _RESEARCH_GEN_TYPES else None
+
+
+def is_research_repo(repo: Path) -> bool:
+    """True iff `.gad/backlog.md` carries the `gad-mode: research` marker — the same disk fact
+    gad-run's survey sets `researchMode` from (gad-run.js:219), written by the research backlog
+    template as an HTML comment (templates/backlog-research.md:3). Read-only and tolerant of a
+    missing/unreadable backlog (a non-research repo, by definition).
+
+    A9 audit fix: this used to be a bare substring test over the ENTIRE backlog, so a build repo
+    whose narrative merely discusses "gad-mode: research" (or any other prose containing that
+    exact phrase) was wrongly flipped into the auto-ideation branch and never terminated cleanly
+    on an exhausted backlog. Now requires the marker to appear (a) inside an HTML comment — the
+    only rendering the template actually produces — and (b) in the PREAMBLE, before the first
+    `## G<n>` backlog heading, mirroring where the template places it and keeping a per-entry
+    discussion of research methodology from accidentally counting.
+    """
+    text = _read_backlog(repo)
+    if text is None:
+        return False
+    first_heading = _BACKLOG_HEADER_RE.search(text)
+    preamble = text[: first_heading.start()] if first_heading is not None else text
+    return any(_RESEARCH_MODE_MARKER in comment for comment in _HTML_COMMENT_RE.findall(preamble))
 
 
 def completed_generations(index: dict[str, Any] | None) -> set[int]:
@@ -275,15 +456,38 @@ def handoff_path(repo: Path, gen: int) -> Path:
 # Artifact census (the feasibility-critical recovery-routing check)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# The ONE genuine Verify-or-later artifact FINISH-safety is gated on. See the module docstring
-# for the full chain of reasoning: gad-generation.js's `phase('Verify')` block writes exactly
-# this file ("Write ${DIR}/reviews/verification.md"), and Verify can only run after Guardrails'
-# test-writer returned non-null (a null result makes the script `deadAgentAbort` and `return`
-# before Verify ever starts). Deliberately NOT any path-pattern/test-file heuristic — a prior
-# version of this check ("does some dirty path look like a test file") was broken by BOTH a
-# Prep-phase fixture written under `tests/` and a coincidentally `test_`-named file anywhere in
-# the repo, either of which could satisfy it before Guardrails ever ran.
+# The genuine Verify-or-later artifacts FINISH-safety is gated on. See the module docstring for
+# the full chain of reasoning: gad-generation.js's `phase('Verify')` block writes exactly this
+# file ("Write ${DIR}/reviews/verification.md"), and Verify can only run after Guardrails'
+# test-writer (or, for `genType: 'ideation'`, the skeptic-vet) returned non-null (a null result
+# makes the script `deadAgentAbort` and `return` before Verify ever starts). Deliberately NOT any
+# path-pattern/test-file heuristic — a prior version of this check ("does some dirty path look
+# like a test file") was broken by BOTH a Prep-phase fixture written under `tests/` and a
+# coincidentally `test_`-named file anywhere in the repo, either of which could satisfy it before
+# Guardrails ever ran.
 _VERIFY_ARTIFACT_RELATIVE = ("reviews", "verification.md")
+
+# REFUSED-status regression fix (2026-07-26, gad-kit uncommitted 2.1.0 work): `verification.md`
+# alone is NO LONGER sufficient proof that Guardrails fully completed. gad-generation.js's
+# Guardrails phase treats the adversarial-reviewer/results-skeptic component as ADVISORY for
+# non-ideation genTypes — if it dies after retries the workflow logs "proceeding without an
+# adversarial review this generation (the verifier + gate remain the backstop)" and continues
+# straight to Verify anyway, which still writes verification.md. So "verification.md present,
+# adversarial-review.md absent" is an ORDINARY, gad-kit-sanctioned state for a committed
+# generation — but it is NOT a safe FINISH target for a generation that died mid-tail, because
+# gad-finish.js's own Verify prompt now MECHANICALLY REFUSES exactly this case (ship-blocker 2,
+# same date): if `reviews/adversarial-review.md` is absent it sets `guardrailsArtifactMissing`
+# and returns `status: 'REFUSED'` with NO commit, NO fix-loop spend — the tail considers itself
+# the wrong route for that generation. Before this fix, `triage()` would route such a
+# generation to FINISH anyway (verification.md alone was "proof enough"), gad-finish would
+# refuse and write nothing, `outcome()` would read that as AGENT_DEAD_NONLIMIT, and the identical
+# refused FINISH would be retried 2 more times before HARD_ERROR — a livelock on a generation
+# that a full `/gad-generation` restart handles perfectly well (claude-relay's own existing safe
+# default whenever FINISH-safety is unproven). For `genType: 'ideation'` this can never diverge:
+# the SAME agent call that is the hard-required guardrail (`vet === null` aborts) is the one that
+# writes adversarial-review.md, so requiring both files uniformly never rejects a genuinely
+# resumable ideation generation — it only excludes the non-ideation advisory-death gap.
+_ADVERSARIAL_REVIEW_RELATIVE = ("reviews", "adversarial-review.md")
 
 
 def artifact_census(repo: Path, gen: int) -> dict[str, Any]:
@@ -294,13 +498,19 @@ def artifact_census(repo: Path, gen: int) -> dict[str, Any]:
     gen_dir = generation_dir(repo, gen)
     reviews_dir = gen_dir / "reviews"
     reviews_present = sorted(name for name in _REVIEW_FILENAMES if (reviews_dir / name).exists())
+    adversarial_review = (reviews_dir / "adversarial-review.md").exists()
     return {
         "plan": (gen_dir / "plan.md").exists(),
         "reviews_present": reviews_present,
         "setup_notes": (gen_dir / "setup-notes.md").exists(),
         "implementation_log": (gen_dir / "implementation-log.md").exists(),
-        "adversarial_review": (reviews_dir / "adversarial-review.md").exists(),
-        "verify_or_later": gen_dir.joinpath(*_VERIFY_ARTIFACT_RELATIVE).exists(),
+        "adversarial_review": adversarial_review,
+        # Both files required (REFUSED-status fix, see `_ADVERSARIAL_REVIEW_RELATIVE` above):
+        # verification.md alone no longer proves Guardrails fully completed.
+        "verify_or_later": (
+            gen_dir.joinpath(*_VERIFY_ARTIFACT_RELATIVE).exists()
+            and gen_dir.joinpath(*_ADVERSARIAL_REVIEW_RELATIVE).exists()
+        ),
     }
 
 
@@ -321,6 +531,21 @@ def git_head(repo: Path) -> str | None:
         return None
     head = result.stdout.strip()
     return head or None
+
+
+def git_log_has_gen_commit(repo: Path, gen: int) -> bool:
+    """True if the current branch's history already has a `gen-<N>:` commit for `gen` — the
+    literal message prefix `consolidator.md` step 8 / gad-kit's own IDEMPOTENT COMMIT guard use
+    (`git commit -m "gen-N: <title>" ...`, `git log --oneline -15 --grep='^gen-N:'`). This is
+    git's own durable record of "this generation's work was committed," independent of
+    `generations-index.json`'s bookkeeping — which can legitimately lag behind git if a process
+    dies between the artifact commit and a LATER, separate index-only reconciliation (exactly the
+    gap that guard exists for). Unbounded (unlike gad-kit's own `-15`-commit window, C14): a
+    `git log --grep` stops at the first match by default, so this is cheap regardless of history
+    length, and there is no reason to accept the same staleness gad-kit's own bound risks.
+    """
+    result = _git(repo, "log", "--grep", f"^gen-{gen}:", "--format=%H", "-1")
+    return result.returncode == 0 and bool(result.stdout.strip())
 
 
 def git_status_porcelain(repo: Path) -> list[str]:
@@ -356,15 +581,24 @@ def git_stash_push(repo: Path, message: str) -> str | None:
     return message
 
 
-def _has_gad_dirty_signal(repo: Path, next_gen: int, status_lines: list[str]) -> bool:
+def _has_gad_dirty_signal(status_lines: list[str]) -> bool:
     """One of TWO conditions `triage()` requires before ever touching a dirty tree (the other
     is a matching clean-baseline HEAD, checked by the caller): does the dirty set look like an
-    in-progress gad-kit generation at all? Signal: the `generation-<next_gen>/` scaffold
-    directory exists (only gad-generation's own phases create it) OR some changed path is
-    under `.gad/`. This is a heuristic, not a proof — flagged in uncertainty-ledger.jsonl.
+    in-progress gad-kit generation at all? Signal: at least one changed path in `git status
+    --porcelain` is under `.gad/`. This is a heuristic, not a proof — flagged in
+    uncertainty-ledger.jsonl.
+
+    B10 audit fix: this used to ALSO return True whenever `generation_dir(repo, next_gen)`
+    merely EXISTED on disk, with no reference to `status_lines` at all. Once that scaffold
+    directory was created — by any earlier gad-kit phase, possibly one that already committed —
+    this clause was satisfied permanently and gated nothing: reproduced with three unrelated
+    operator files (two of them untracked) getting swept into a `git stash` with ZERO `.gad/`
+    paths anywhere in the dirty set. The docstring above always described the signal as "some
+    changed path is under `.gad/`" — the directory-existence clause never actually matched that
+    description, so it is removed here rather than special-cased. (No longer takes `repo`/
+    `next_gen` at all: with the bare-existence clause gone, this function needs nothing but the
+    porcelain lines themselves.)
     """
-    if generation_dir(repo, next_gen).exists():
-        return True
     for line in status_lines:
         path = _status_line_path(line)
         if path and (path == ".gad" or path.startswith(".gad/")):
@@ -376,6 +610,184 @@ def _dirty_paths(status_lines: list[str]) -> list[str]:
     return [path for line in status_lines if (path := _status_line_path(line))]
 
 
+# B13 audit fix, second round: `resolve_owner_decision()`'s own immediate commit can fail (a
+# rejecting pre-commit hook, an unset git identity — both ordinary operator conditions, not
+# exotic). Left unhandled, the NEXT `triage()` either parks the repo forever (HEAD moved since
+# the last clean baseline) or, worse, sweeps the resolution into a `git stash` as part of an
+# unrelated dirty-tree recovery, reverting the decision back to `"open"` — silently destroying
+# the operator's answer. These two helpers give `triage()` a defense-in-depth exemption: a LONE
+# uncommitted `ownerDecisions[].status` diff on `generations-index.json` is never treated as
+# stash-worthy "mid-generation interruption" dirt, no matter how many times committing it fails.
+def _is_index_only_owner_decision_dirt(repo: Path, status_lines: list[str]) -> bool:
+    """True iff the ENTIRE dirty set is exactly one path — a MODIFIED (not added/deleted/
+    untracked) `generations-index.json` — the exact shape `resolve_owner_decision()`'s own write
+    produces when its immediate commit attempt fails. Deliberately narrow: any OTHER dirty path
+    alongside it (a genuinely in-progress generation touching `.gad/` too) does not qualify, so
+    this can never mask real in-flight work — only the specific "nothing dirty except a pending
+    resolution" shape.
+    """
+    if len(status_lines) != 1:
+        return False
+    path = _status_line_path(status_lines[0])
+    if path is None:
+        return False
+    try:
+        index_relative = index_path(repo).relative_to(Path(repo)).as_posix()
+    except ValueError:  # pragma: no cover - defensive; index_path() is always repo/.gad/...
+        return False
+    if path != index_relative:
+        return False
+    code = status_lines[0][:2]
+    # Only a MODIFICATION of an already-tracked file counts. "??" (untracked — e.g. a repo whose
+    # `.gad/` was never committed at all) or a staged add/delete is a different situation this
+    # exemption does not apply to.
+    return "?" not in code and "M" in code
+
+
+def _retry_commit_index_only(repo: Path, path: Path) -> bool:
+    """Best-effort: (re-)attempt to commit JUST `generations-index.json`, mirroring
+    `resolve_owner_decision()`'s own immediate attempt. Called from `triage()` on every cycle
+    while the dirty set is EXACTLY this file — a transient failure (a flaky hook) self-heals
+    without operator intervention; a permanent one (an unset git identity) costs one cheap
+    `git add` + `git commit` attempt per triage cycle and is otherwise harmless (the JSON content
+    is already the source of truth `blocking_decisions()` reads regardless of commit status).
+    Returns whether the commit landed.
+    """
+    add_result = _git(repo, "add", "--", str(path))
+    if add_result.returncode != 0:
+        return False
+    commit_result = _git(
+        repo,
+        "commit",
+        "-m",
+        "claude-relay: land a previously-uncommitted ownerDecision resolution",
+        "--",
+        str(path),
+    )
+    return commit_result.returncode == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Which generation is actually in flight (disk evidence, NOT index.nextGen)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def existing_generation_dirs(repo: Path) -> dict[int, Path]:
+    """Every `.gad/generation-<N>/` directory currently on disk, keyed by N. Non-numeric suffixes
+    are ignored (nothing in gad-kit creates them, but a stray `generation-old/` must not raise).
+    """
+    gad_dir = Path(repo) / ".gad"
+    found: dict[int, Path] = {}
+    if not gad_dir.is_dir():
+        return found
+    for child in gad_dir.glob("generation-*"):
+        if not child.is_dir():
+            continue
+        try:
+            found[int(child.name.split("-", 1)[1])] = child
+        except (IndexError, ValueError):
+            continue
+    return found
+
+
+def in_flight_generation(repo: Path, index: dict[str, Any] | None, status_lines: list[str]) -> int | None:
+    """The generation whose work the DISK shows in progress, or None when disk says nothing.
+
+    `index.nextGen` cannot answer this: it only advances on a successful consolidation
+    (agents/consolidator.md:91), and gad-kit 2.0's crawl runs pending generations in
+    `priority DESC, gen ASC` order (gad-run.js:283) rather than gen order — so after an
+    out-of-order generation is interrupted, `nextGen` names a generation whose directory is empty
+    while the real partial work sits under a different one. Keying the artifact census off
+    `nextGen` there made `verify_or_later` read as False and sent claude-relay to stash the
+    in-flight tree and "restart" an unrelated generation (2026-07-26 audit).
+
+    Evidence precedence, strongest first:
+    1. A DIRTY path under `.gad/generation-<N>/` whose N is not already committed. Uncommitted
+       artifacts are the strongest possible signal that N is the generation being worked on.
+       Ties (two uncommitted generations both dirty — e.g. a resumable one plus a fresh one) are
+       not resolvable from gen-number order alone (A3 audit fix: a prior version took `max(N)`
+       here, reasoning "generation numbers are creation order" — but gad-kit 2.0's crawl runs
+       generations `priority DESC, gen ASC` (gad-run.js:283), NOT creation order, so a stale
+       abandoned high-numbered scaffold could outrank a genuinely in-progress lower-numbered one).
+       Tie-broken the SAME way tier 2 already is: the most recently MODIFIED directory wins,
+       falling back to the larger N only if mtimes are unreadable or exactly tied.
+    2. Otherwise the most recently MODIFIED not-yet-committed `.gad/generation-<N>/` directory.
+       Weaker (an mtime survives a `git stash`, and any read tool can bump nothing but still),
+       but it is the only evidence left once the tree is clean of that generation's files.
+    3. Otherwise None — the caller keeps its pre-existing `nextGen` behaviour rather than guess.
+    """
+    completed = completed_generations(index)
+
+    def _mtime(gen: int) -> float:
+        try:
+            return generation_dir(repo, gen).stat().st_mtime
+        except OSError:  # pragma: no cover - directory vanished between evidence collection and stat
+            return -1.0
+
+    dirty_gens = {
+        int(match.group(1))
+        for path in _dirty_paths(status_lines)
+        if (match := _GEN_PATH_RE.search(path)) is not None
+    }
+    uncommitted_dirty = sorted(gen for gen in dirty_gens if gen not in completed)
+    if uncommitted_dirty:
+        if len(uncommitted_dirty) == 1:
+            return uncommitted_dirty[0]
+        return max(uncommitted_dirty, key=lambda gen: (_mtime(gen), gen))
+
+    candidates = {gen: path for gen, path in existing_generation_dirs(repo).items() if gen not in completed}
+    if not candidates:
+        return None
+    try:
+        return max(candidates, key=lambda gen: (candidates[gen].stat().st_mtime, gen))
+    except OSError:  # pragma: no cover - the directory vanished between glob and stat
+        return None
+
+
+def find_uncommitted_handoff(repo: Path, index: dict[str, Any] | None, preferred: int | None) -> int | None:
+    """The generation number of an on-disk `handoff.md` belonging to a generation that has NOT
+    been committed, or None.
+
+    v1 only ever looked at `generation-<nextGen>/handoff.md`, which misses the consolidator
+    refusal it exists to catch whenever the interrupted generation is not `nextGen` (see
+    `in_flight_generation()`): claude-relay then un-parked, spawned a run, and gad-kit's own
+    dirty-tree/blocked handling stopped it again with nothing new on disk. Committed generations
+    are excluded because a `handoff.md` file is never deleted once a later `/gad-finish` succeeds,
+    so an old one must not park the repo forever. `preferred` (the in-flight generation) wins when
+    it has a handoff; otherwise the smallest blocked generation is reported, so the operator is
+    pointed at the earliest real blocker deterministically.
+
+    2026-07-26 fix (live-verified against a real gad-kit run): `handoff.md`'s mere EXISTENCE was
+    never a BLOCKED signal — `agents/consolidator.md` step 2 writes it as an ordinary per-
+    generation artifact (open questions, the ranked "DECISIONS THE OWNER MUST MAKE" section,
+    live-seam operator actions, the opportunity scout) on EVERY generation, committed status
+    included; only the precondition-failure path (step "do NOT commit ... instead write the
+    blocker to handoff.md") makes it a genuine blocker, and nothing on disk distinguishes the two
+    cases by the file's mere presence. Per Invariant #2, the `## Status:` line inside the file is
+    model-written prose and is deliberately never parsed here — only disk-visible facts decide.
+    A generation is trusted as committed (hence its handoff, if any, is non-blocking) if EITHER
+    `generations-index.json` says so (the fast path) OR git history already has a `gen-<N>:`
+    commit for it (`git_log_has_gen_commit()` — the durable fallback for the exact gap
+    consolidator.md's own IDEMPOTENT COMMIT guard exists for: a process dying between the
+    artifact commit and a later, separate index-only reconciliation).
+    """
+    completed = completed_generations(index)
+
+    def _is_committed(gen: int) -> bool:
+        return gen in completed or git_log_has_gen_commit(repo, gen)
+
+    blocked = sorted(
+        gen
+        for gen in existing_generation_dirs(repo)
+        if not _is_committed(gen) and handoff_path(repo, gen).exists()
+    )
+    if not blocked:
+        return None
+    if preferred is not None and preferred in blocked:
+        return preferred
+    return blocked[0]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # triage / command
 # ─────────────────────────────────────────────────────────────────────────────
@@ -383,23 +795,34 @@ def _dirty_paths(status_lines: list[str]) -> list[str]:
 
 def triage(repo: Path, config: Config, state: dict[str, Any], *, dry_run: bool = False) -> Plan:
     """Decide what claude-relay should do next for `repo`, in the order DESIGN.md §5 specifies:
-    1. open, GATED owner-decision blocking nextGen         -> AWAITING_HUMAN
-    2. `generation-<nextGen>/handoff.md` present            -> BLOCKED
-    3. dirty tree, no handoff (mid-generation interruption) -> artifact census -> FINISH or a
-       safe `/gad-generation` restart (after `git stash`), or AWAITING_HUMAN if the dirtiness
-       cannot be attributed to this tool's own run at all
+    1. open, GATED owner-decision blocking the earliest pending gen -> AWAITING_HUMAN
+    2. any UNCOMMITTED `generation-<N>/handoff.md` present   -> BLOCKED
+    3. dirty tree, no handoff (mid-generation interruption) -> artifact census of the generation
+       DISK says is in flight -> FINISH or a safe `/gad-generation` restart (after `git stash`),
+       or AWAITING_HUMAN if the dirtiness cannot be attributed to this tool's own run at all
     4. clean tree, backlog has pending generations          -> RUN `/gad-run --max 1`
-    5. clean tree, backlog exhausted                        -> DONE
+    5. clean tree, backlog exhausted                        -> DONE, except that a RESEARCH repo
+       gets one `/gad-run` per HEAD so gad-run's own auto-ideation can refill the backlog
+
+    Steps 1-3 no longer key off `index.nextGen`: see `in_flight_generation()` and the module
+    docstring for why that field does not name the generation whose work is on disk in gad-kit 2.0.
 
     `state` (the same dict `cooldown.load_state()`/`save_state()` round-trip) is consulted and
     updated for the clean-baseline-HEAD bookkeeping step 3 needs (Invariant #6/#9: never
-    blanket-stash a dirty tree we cannot attribute to our own run) — the caller is responsible
-    for eventually persisting it via `cooldown.save_state()`.
+    blanket-stash a dirty tree we cannot attribute to our own run) and for the once-per-HEAD
+    ideation bookkeeping step 5 needs — the caller is responsible for eventually persisting it via
+    `cooldown.save_state()`.
 
     `dry_run=True` (used by `claude-relay run --dry-run` and the `status`/park-loop previews)
     computes the identical decision but NEVER actually creates a `git stash` — triage must stay
     side-effect-free on the repo in that mode (it may still update the in-memory `state` dict's
-    baseline bookkeeping; callers that pass `dry_run=True` are not required to persist that).
+    baseline/ideation bookkeeping; callers that pass `dry_run=True` are not required to persist
+    that). A10 audit fix: this docstring used to also claim "every current one hands triage a
+    `copy.deepcopy(state)` anyway" — false: `loop._park_and_wait()` deliberately passes the REAL
+    `state` object (with `dry_run=True`) so the clean-baseline/ideation bookkeeping legitimately
+    persists while the repo sits parked; `dry_run=True` there suppresses only the `git stash`
+    side effect, not the state mutation. The false claim is corrected here rather than left to
+    mislead the next reader into re-introducing the bug it warns about.
     """
     repo = Path(repo)
     index = read_index(repo)
@@ -413,36 +836,105 @@ def triage(repo: Path, config: Config, state: dict[str, Any], *, dry_run: bool =
         )
 
     next_gen = int(index.get("nextGen", 0) or 0)
+    pending = pending_generations(repo, index)
+    status_lines = git_status_porcelain(repo)
+    # B13 defense-in-depth (second-round blocker fix): if the ENTIRE dirty set is nothing but a
+    # lone, uncommitted ownerDecisions[].status resolution (`resolve_owner_decision()`'s own
+    # immediate commit attempt having failed — a rejecting pre-commit hook, an unset git
+    # identity), retry landing that one commit HERE, on every triage cycle, at near-zero cost —
+    # this is what lets a transient hook failure self-heal without operator intervention. Never
+    # attempted in `dry_run=True` mode (triage must stay side-effect-free on the repo then).
+    if not dry_run and _is_index_only_owner_decision_dirt(repo, status_lines):
+        _retry_commit_index_only(repo, index_path(repo))
+        status_lines = git_status_porcelain(repo)
+    # The generation the DISK shows in flight — the census/FINISH/restart target. Falls back to
+    # `nextGen` only when disk is silent, so an ambiguous repo keeps the pre-2.0 behaviour.
+    in_flight = in_flight_generation(repo, index, status_lines)
+    # A5 audit fix: `in_flight` is PURE disk evidence (git status + directory mtimes) — it can
+    # name a generation number the backlog never declared at all. The concrete case: gad-run's
+    # own auto-ideation sub-generation numbers itself `maxBacklogGen + 1` (gad-run.js), and that
+    # number never gets a `## G<n>` heading, so `pending_generations()` never lists it. Recovering
+    # such a number is unsafe: `backlog_gen_type()` has no backlog section to read for it and
+    # silently returns None -> gad-generation.js/gad-finish.js coerce that to 'build' -> an
+    # interrupted ideation generation gets FINISHed or restarted as an ordinary build generation,
+    # and the consolidator never receives the instruction to append the vetted candidates (the
+    # refill then "succeeds" — commits, advances HEAD — having produced nothing). Trust
+    # `in_flight` as the recovery target only when it names a generation we can attribute to a
+    # real, still-pending backlog entry; otherwise fall back to `nextGen`, exactly like the "disk
+    # says nothing at all" case. (`in_flight_generation()` itself stays backlog-agnostic on
+    # purpose — its own unit tests pin that contract — so this filter lives here, at its one call
+    # site, where `pending` is already in scope.)
+    in_flight_pending = in_flight if in_flight is not None and in_flight in pending else None
+    recovery_gen = in_flight_pending if in_flight_pending is not None else next_gen
 
-    blocking = blocking_decisions(find_owner_decisions(index), next_gen)
+    # The owner-decision gate is `blocksGen <= X`, so X must be the generation about to be
+    # attempted NEXT — which is `recovery_gen` for a dirty-tree recovery (FINISH or a
+    # `/gad-generation` restart) and the smallest PENDING generation for a fresh `/gad-run` on a
+    # clean tree (gad-run.js:222 computes its own `nextGen` the same way: "the smallest pending
+    # gen number (or the index's nextGen if the backlog has none left)"). A4 audit fix: this used
+    # to be `pending[0]` unconditionally, so an owner decision gating an out-of-order
+    # `recovery_gen` (which can be LARGER than `pending[0]` — that is the whole point of the
+    # priority-sorted crawl) silently slipped through this check; gad-kit's own preflight then
+    # halted on it anyway, writing nothing to disk, and claude-relay retried three times into
+    # HARD_ERROR — re-entering the exact livelock the recovery-routing fix exists to prevent.
+    gate_gen = recovery_gen if status_lines else (pending[0] if pending else next_gen)
+    blocking = blocking_decisions(find_owner_decisions(index), gate_gen)
     if blocking:
         ids = tuple(str(d.get("id")) for d in blocking)
         return Plan(
             kind="AWAITING_HUMAN",
             repo=repo,
-            gen=next_gen,
-            detail=f"gen {next_gen} is gated on open owner decision(s): {list(ids)}",
+            gen=gate_gen,
+            detail=f"gen {gate_gen} is gated on open owner decision(s): {list(ids)}",
             blocking_decision_ids=ids,
         )
 
-    handoff = handoff_path(repo, next_gen)
-    if handoff.exists():
+    # A7 audit fix: `find_uncommitted_handoff()` only excludes ALREADY-COMPLETED generations, and
+    # nothing requires the tree to be dirty at all — a `handoff.md` file COMMITTED long ago under
+    # a generation that was never declared in the current backlog (a hand-edited/experimental
+    # directory, or a backlog entry later removed) is neither completed nor pending, has no path
+    # back (nothing will ever consolidate a number the backlog does not declare), and would
+    # otherwise park an entirely CLEAN tree on it forever (one notification, then silence, since
+    # the same stale handoff satisfies the check on every future triage too). Only trust the
+    # result when it names either a currently PENDING generation, or `next_gen` itself — the
+    # latter matters because the auto-ideation refill's own recovery target IS `next_gen` (see
+    # `_exhausted_backlog_plan()`) even though, per the A5 note above, that generation can never
+    # appear in `pending` at all; an interrupted ideation attempt's handoff is a real, current
+    # signal a human should see, not a stale orphan. `preferred` is fed the already-filtered
+    # `in_flight_pending` (not the raw `in_flight`) so an untrustworthy in-flight number can't
+    # even steer which blocked generation gets reported when more than one is blocked.
+    handoff_gen = find_uncommitted_handoff(repo, index, in_flight_pending)
+    if handoff_gen is not None and (handoff_gen in pending or handoff_gen == next_gen):
         return Plan(
             kind="BLOCKED",
             repo=repo,
-            gen=next_gen,
+            gen=handoff_gen,
             detail=(
-                f"consolidator handoff present at {handoff} — resolve the blocker "
+                f"consolidator handoff present at {handoff_path(repo, handoff_gen)} (generation "
+                f"{handoff_gen}) — resolve the blocker "
                 f"(claude-relay resolve <id> <answer>, or manual edit), then re-run"
             ),
         )
 
-    status_lines = git_status_porcelain(repo)
-    if status_lines:
+    # B13 defense-in-depth: even after the retry-commit attempt above, a LONE uncommitted
+    # ownerDecisions[].status diff (a permanently unset git identity never lands, however many
+    # cycles retry) must NEVER be treated as "mid-generation interruption" dirt — that path can
+    # `git stash` it, reverting a resolved decision back to `"open"` (the exact B13 failure mode,
+    # reached this time via a commit that keeps failing rather than one that was never
+    # attempted). Bypassing the whole branch below leaves the file exactly as it is: unstashed,
+    # uncommitted, but already unblocking (`blocking_decisions()` reads the JSON content
+    # directly, not git-committed state) — a future gad-kit commit will fold it in naturally.
+    index_only_dirt = _is_index_only_owner_decision_dirt(repo, status_lines)
+    if status_lines and not index_only_dirt:
         head = git_head(repo)
         baseline_head = cooldown.get_clean_baseline(state, repo)
         baseline_matches = baseline_head is not None and baseline_head == head
-        gad_signal = _has_gad_dirty_signal(repo, next_gen, status_lines)
+        # No longer takes a generation number at all (B10 fix removed the last clause that did) —
+        # this is the gate that decides whether claude-relay may touch the tree AT ALL, and it is
+        # satisfied only by an actual dirty path under `.gad/`, full stop. That keeps *whether* we
+        # may `git stash` (this gate) independent of *which* generation we then recover
+        # (`recovery_gen`, A5) — Invariant #6 requires the former never be broadened by the latter.
+        gad_signal = _has_gad_dirty_signal(status_lines)
 
         if not (baseline_matches and gad_signal):
             reasons = []
@@ -463,31 +955,39 @@ def triage(repo: Path, config: Config, state: dict[str, Any], *, dry_run: bool =
                 ),
             )
 
-        census = artifact_census(repo, next_gen)
+        # Both recovery tails MUST carry the generation's declared genType — dropping it silently
+        # downgrades a research generation to `build` inside gad-generation.js/gad-finish.js
+        # (see `backlog_gen_type()`), which swaps the planner/implement/guardrail roles and drops
+        # the research verify/fix notes. gad-run threads it per-generation; we are the only other
+        # caller of those two scripts.
+        gen_type = backlog_gen_type(repo, recovery_gen)
+        census = artifact_census(repo, recovery_gen)
         if census["verify_or_later"]:
             return Plan(
                 kind="FINISH",
                 repo=repo,
-                gen=next_gen,
+                gen=recovery_gen,
                 mode="gad_finish",
                 tier=config.gadkit_tier,
                 token_target=config.token_target,
-                extra_flags=tuple(config.gadkit_extra_flags),
+                gen_type=gen_type,
                 detail=(
-                    f"{generation_dir(repo, next_gen)}/reviews/verification.md present — the "
-                    "Verify phase (which only ever starts after Guardrails' test-writer "
-                    "succeeded) already ran at least once; safe to resume via /gad-finish"
+                    f"{generation_dir(repo, recovery_gen)}/reviews/verification.md AND "
+                    "reviews/adversarial-review.md both present — Guardrails' hard-required "
+                    "agent succeeded AND the adversarial-review/skeptic-vet artifact gad-finish "
+                    "itself now mechanically requires (else it returns REFUSED) is on disk; "
+                    "safe to resume via /gad-finish"
                 ),
             )
         if dry_run:
             return Plan(
                 kind="RUN",
                 repo=repo,
-                gen=next_gen,
+                gen=recovery_gen,
                 mode="gad_generation",
                 tier=config.gadkit_tier,
                 token_target=config.token_target,
-                extra_flags=tuple(config.gadkit_extra_flags),
+                gen_type=gen_type,
                 stashed_ref=None,
                 detail=(
                     "[dry-run] mid-generation interruption with no reviews/verification.md yet "
@@ -498,18 +998,18 @@ def triage(repo: Path, config: Config, state: dict[str, Any], *, dry_run: bool =
             )
         dirty_paths = _dirty_paths(status_lines)
         stash_ref = git_stash_push(
-            repo, f"claude-relay: parking gen{next_gen} before safe restart {_now_iso()}"
+            repo, f"claude-relay: parking gen{recovery_gen} before safe restart {_now_iso()}"
         )
         if stash_ref is not None:
             cooldown.record_stash(state, repo, stash_ref, dirty_paths)
         return Plan(
             kind="RUN",
             repo=repo,
-            gen=next_gen,
+            gen=recovery_gen,
             mode="gad_generation",
             tier=config.gadkit_tier,
             token_target=config.token_target,
-            extra_flags=tuple(config.gadkit_extra_flags),
+            gen_type=gen_type,
             stashed_ref=stash_ref,
             detail=(
                 "mid-generation interruption with no reviews/verification.md yet "
@@ -522,15 +1022,12 @@ def triage(repo: Path, config: Config, state: dict[str, Any], *, dry_run: bool =
     # Clean tree: this is the one point where we know for certain claude-relay is looking at a
     # committed-green boundary — record it as the baseline any FUTURE dirty state is measured
     # against (Invariant #6/#9).
-    cooldown.set_clean_baseline(state, repo, git_head(repo))
+    head = git_head(repo)
+    cooldown.set_clean_baseline(state, repo, head)
 
-    pending = pending_generations(repo, index)
     if not pending:
-        return Plan(
-            kind="DONE",
-            repo=repo,
-            gen=next_gen,
-            detail="backlog exhausted — no pending generations declared beyond what is committed",
+        return _exhausted_backlog_plan(
+            repo, config, state, next_gen=next_gen, head=head, dry_run=dry_run
         )
 
     return Plan(
@@ -540,8 +1037,83 @@ def triage(repo: Path, config: Config, state: dict[str, Any], *, dry_run: bool =
         mode="gad_run",
         tier=config.gadkit_tier,
         token_target=config.token_target,
-        extra_flags=tuple(config.gadkit_extra_flags),
         detail=f"{len(pending)} pending generation(s) {pending}; clean tree at a committed boundary",
+    )
+
+
+def _exhausted_backlog_plan(
+    repo: Path,
+    config: Config,
+    state: dict[str, Any],
+    *,
+    next_gen: int,
+    head: str | None,
+    dry_run: bool,
+) -> Plan:
+    """Step 5: what an exhausted backlog on a clean tree means.
+
+    For a classic build repo it means DONE, as it always has. For a RESEARCH repo it does NOT:
+    gad-run's auto-ideation (`AUTO_IDEATE` defaults ON, gad-run.js:98) fires precisely in the
+    backlog-exhausted branch (gad-run.js:263-276) — it runs one `genType: 'ideation'` generation
+    whose consolidator appends freshly-vetted hypotheses to `.gad/backlog.md`, and the next crawl
+    picks them up. That is gad-kit's "a multi-day research crawl never starves" guarantee, and
+    claude-relay used to make it unreachable by returning DONE (which loop.run() treats as
+    terminal, exit 0) in the one state where the refill would have fired. So hand the decision to
+    gad-run instead of terminating.
+
+    Bounded so it can never livelock: the attempt is recorded against the CURRENT git HEAD. A
+    successful ideation commits, which moves HEAD, so the next exhaustion legitimately earns a
+    fresh attempt; a failed one leaves HEAD where it was and the next triage returns DONE with a
+    detail saying the refill was tried and did not land. (`head is None` — a repo with no commits
+    at all — cannot be bounded this way, so it degrades to plain DONE rather than loop.)
+
+    A `dry_run=True` triage deliberately does NOT book the attempt, even in memory. `loop.py`'s
+    `_park_and_wait()` re-triages a parked repo with `dry_run=True` but the REAL `state` object,
+    so booking there would consume the repo's only refill during a mere re-check and the
+    `dry_run=False` triage that follows would immediately return DONE — the refill would never
+    run. Only the triage that can actually lead to a spend books the attempt (and `loop.run_once()`
+    hands it back via `cooldown.clear_ideation_attempt_head()` if no seat was available to spend
+    it on).
+    """
+    if not is_research_repo(repo):
+        return Plan(
+            kind="DONE",
+            repo=repo,
+            gen=next_gen,
+            detail="backlog exhausted — no pending generations declared beyond what is committed",
+        )
+    attempted_at = cooldown.get_ideation_attempt_head(state, repo)
+    if head is None or attempted_at == head:
+        return Plan(
+            kind="DONE",
+            repo=repo,
+            gen=next_gen,
+            detail=(
+                "backlog exhausted in a research repo, and an auto-ideation refill was already "
+                f"attempted at this HEAD ({head}) without landing a commit — stopping rather than "
+                "re-spending on a refill that just failed; triage the last run's log, then re-run"
+            ),
+        )
+    if not dry_run:
+        cooldown.set_ideation_attempt_head(state, repo, head)
+    return Plan(
+        kind="RUN",
+        repo=repo,
+        gen=next_gen,
+        mode="gad_run",
+        tier=config.gadkit_tier,
+        token_target=config.token_target,
+        # A6 audit fix: mark this as THE ideation-refill plan (see the `ideation_refill` field
+        # docstring) so `loop.run_once()`'s no-seat early return can gate
+        # `cooldown.clear_ideation_attempt_head()` on it — giving the booking back only when
+        # THIS plan is the one that made it, never for an unrelated RUN/FINISH plan.
+        ideation_refill=True,
+        detail=(
+            "backlog exhausted in a RESEARCH repo ('gad-mode: research' in .gad/backlog.md) — "
+            "handing this to /gad-run so its auto-ideation can refill the hypothesis queue "
+            "instead of terminating; one attempt per HEAD, so a refill that fails to commit "
+            "ends the crawl on the next triage"
+        ),
     )
 
 
@@ -605,6 +1177,15 @@ def command(plan: Plan) -> list[str]:
     roles_dir = str(root / "agents")
     budget_directive = ""
 
+    # gad-kit 2.0's `genType`, omitted entirely when None. Both recovery scripts coerce an
+    # absent/unknown value to 'build' with no error path (gad-generation.js:124,
+    # gad-finish.js:65), so passing `genType: null` would be indistinguishable from omitting it —
+    # but omitting it is what gad-run itself does (gad-run.js:350 spreads the key only when the
+    # entry declares a non-'build' type), and keeping the args byte-identical to gad-run's own is
+    # the point. NOT threaded into `gad_run` mode: gad-run derives genType per-generation from each
+    # backlog entry, so a single value there would mislabel every other generation in the crawl.
+    gen_type_arg: dict[str, Any] = {} if plan.gen_type is None else {"genType": plan.gen_type}
+
     if plan.mode == "gad_finish":
         script = str(root / "workflows" / "gad-finish.js")
         wf_args: dict[str, Any] = {
@@ -612,6 +1193,7 @@ def command(plan: Plan) -> list[str]:
             "gen": plan.gen,
             "rolesDir": roles_dir,
             "profile": plan.tier,
+            **gen_type_arg,
         }
     elif plan.mode == "gad_generation":
         script = str(root / "workflows" / "gad-generation.js")
@@ -620,6 +1202,7 @@ def command(plan: Plan) -> list[str]:
             "gen": plan.gen,
             "rolesDir": roles_dir,
             "profile": plan.tier,
+            **gen_type_arg,
         }
     elif plan.mode == "gad_run":
         script = str(root / "workflows" / "gad-run.js")
@@ -631,8 +1214,17 @@ def command(plan: Plan) -> list[str]:
             "profile": plan.tier,
             "maxGens": 1,
         }
-        # TOKEN_TARGET (e.g. "+2M"): gad-run.js self-paces to the turn's token target (its
-        # `budget.total`), which the harness reads from a "+N"-style directive in the prompt.
+        # TOKEN_TARGET (e.g. "+2M"): DOCS-ONLY B22 audit fix (2026-07-26) — this used to be
+        # documented (here and in README.md/DESIGN.md/config.example.toml) as "gad-run.js self-
+        # paces to this turn's token target (its `budget.total`)". Verified LIVE against the
+        # installed `claude` 2.1.220 bundle: `budget.total`'s only writer
+        # (`snapshotOutputTokensForTurn`) has NO call site anywhere in the bundle — `budget.total`
+        # is always `null` regardless of what this prompt text says. The directive below is still
+        # appended (harmless prompt text a model may or may not act on, and removing it is a
+        # separate decision this fix does not make), but it is NOT a working pacing mechanism for
+        # claude-relay's own `--max 1` crawl step, and must not be documented as one. Consequence
+        # is limited for claude-relay specifically because `maxGens=1` (above) already supplies
+        # the real turn boundary; it would matter more for a caller using `maxGensPerTick > 1`.
         # Only the crawl step carries it; the recovery tails use gad-generation/finish defaults.
         budget_directive = f" You have a token budget of {plan.token_target} for this turn."
     else:
@@ -685,11 +1277,20 @@ def snapshot(repo: Path) -> Snapshot:
     index = read_index(repo)
     next_gen = int(index.get("nextGen", 0) or 0) if index else None
     head = git_head(repo)
-    handoff_exists = False
     census: dict[str, Any] = {}
     if next_gen is not None:
-        handoff_exists = handoff_path(repo, next_gen).exists()
         census = artifact_census(repo, next_gen)
+    # A8 audit fix: `handoff_exists` used to be keyed on `next_gen` alone
+    # (`handoff_path(repo, next_gen).exists()`), so `outcome()`'s BLOCKED detection (a handoff
+    # newly appearing between the pre/post snapshot) silently missed a consolidator that parked
+    # an OUT-OF-ORDER generation — gad-kit 2.0's priority-sorted crawl (gad-run.js:283) routinely
+    # interrupts a generation whose number differs from `index.nextGen` (see
+    # `in_flight_generation()`'s docstring). `find_uncommitted_handoff()` already scans every
+    # not-yet-committed generation directory for a handoff.md, independent of which number
+    # `nextGen` happens to name right now — exactly "did a consolidator park ANY in-progress
+    # generation." (`census` above stays keyed on `next_gen` deliberately: `artifact_census()`'s
+    # own docstring says it is diagnostic-only, and `outcome()` never reads it.)
+    handoff_exists = find_uncommitted_handoff(repo, index, None) is not None
     decisions = find_owner_decisions(index) if index else []
     open_ids = frozenset(
         str(d.get("id"))
@@ -754,14 +1355,33 @@ class ResolveResult:
     found: bool
     decision: dict[str, Any] | None
     index_path: Path
+    # B13 audit fix, second round (blocker: the commit's return code was never checked, so a
+    # rejecting pre-commit hook or an unset git identity silently left the write uncommitted
+    # while `found=True` was returned unconditionally — indistinguishable from genuine success).
+    # `True` only when the resolution's own commit is confirmed to have landed; `False` means
+    # the JSON write on disk succeeded (the decision IS resolved, and `blocking_decisions()`
+    # already sees it) but the commit did not — callers MUST surface this distinctly, never
+    # report it as an ordinary clean resolution.
+    committed: bool = True
 
 
 def resolve_owner_decision(repo: Path, decision_id: str, answer: str) -> ResolveResult:
     """Atomically mark the matching `ownerDecisions[]` entry (wherever it lives in
-    generations-index.json) as resolved: `status -> "resolved"`, plus a `resolution` note and
+    generations-index.json) as answered: `status -> "answered"`, plus a `resolution` note and
     `resolvedAt` timestamp. This edits DURABLE disk state — not a chat reply — which is what
     actually unblocks a parked AWAITING_HUMAN repo and survives seat rotation (DESIGN.md §7).
     Both `claude-relay resolve` and the Telegram poller call this SAME function.
+
+    `"answered"` is the ONLY unblocking token, and writing anything else livelocked the
+    supervisor (2026-07-26 audit; this used to write `"resolved"`). gad-kit's open-decision
+    predicate is not code — it is a prompt string an agent judges, at two sites:
+    gad-generation.js:443 ('any decision has status "open" (i.e. not "answered")') and
+    gad-run.js:220 ('any decision has status "open"/not "answered"'). A status of `"resolved"`
+    is neither `"open"` nor `"answered"`, so gad-kit's preflight could non-deterministically
+    still park with AWAITING-OWNER while claude-relay's own deterministic check
+    (`blocking_decisions()`, which only treats a literal `"open"` as blocking) considered the
+    repo unblocked: claude-relay un-parked and spawned a run, gad-kit halted writing nothing to
+    disk, `outcome()` returned AGENT_DEAD_NONLIMIT -> RETRY, three times -> HARD_ERROR exit.
     """
     repo = Path(repo)
     path = index_path(repo)
@@ -777,8 +1397,20 @@ def resolve_owner_decision(repo: Path, decision_id: str, answer: str) -> Resolve
             decisions = node.get("ownerDecisions")
             if isinstance(decisions, list):
                 for d in decisions:
-                    if isinstance(d, dict) and str(d.get("id")) == str(decision_id):
-                        d["status"] = "resolved"
+                    # B14 audit fix: only an OPEN decision may be (re-)answered. Without this,
+                    # a STALE `resolve <id> <answer>` replayed from Telegram's retained history
+                    # (the exact consequence of `load_state()` silently reinterpreting a torn
+                    # `state.json` as fresh-empty, resetting `telegramUpdateOffset` to 0) could
+                    # silently overwrite an ALREADY-answered decision's real resolution with old,
+                    # wrong content. Matching on id alone had no such guard. `found=False` here
+                    # reuses the existing "no open ownerDecision with id=... found" message,
+                    # which is now literally accurate rather than merely a fallback string.
+                    if (
+                        isinstance(d, dict)
+                        and str(d.get("id")) == str(decision_id)
+                        and d.get("status") == _OPEN_STATUS
+                    ):
+                        d["status"] = _ANSWERED_STATUS
                         d["resolution"] = answer
                         d["resolvedAt"] = _now_iso()
                         found_decision = d
@@ -793,7 +1425,57 @@ def resolve_owner_decision(repo: Path, decision_id: str, answer: str) -> Resolve
         return ResolveResult(found=False, decision=None, index_path=path)
 
     _atomic_write_json(path, index)
-    return ResolveResult(found=True, decision=found_decision, index_path=path)
+
+    # B13 audit fix (2 independent confirmations, 3 reproductions): leaving this write
+    # uncommitted meant the NEXT `triage()` saw a dirty `generations-index.json` and — depending
+    # on whether HEAD had moved since the last recorded clean baseline — either permanently
+    # parked the repo as AWAITING_HUMAN (HEAD moved: `baseline_matches` false forever) or, WORSE,
+    # swept the resolution itself into a `git stash` as part of an unrelated dirty-tree recovery
+    # (HEAD unmoved: `baseline_matches` true), reverting the decision back to `"open"` — defeating
+    # the entire resolve-in mechanism one layer up. Fix: commit JUST this one file immediately.
+    # `-- <path>` scopes the commit to ONLY the changes already staged for this path, so any
+    # other unrelated dirt already sitting in the tree (e.g. a genuinely in-progress generation)
+    # is left untouched — resolve-in must be durable the instant it returns, not merely "durable
+    # until the next triage." Best-effort: `repo` not being a git repository at all (or `git`
+    # itself being unavailable) must not make `resolve` itself fail — the JSON write already
+    # succeeded and is the actual source of truth `blocking_decisions()` reads.
+    #
+    # Second-round blocker fix (adversarial review, 2026-07-26): the ORIGINAL fix above checked
+    # `add_result.returncode` but never the COMMIT's own return code — so a rejecting pre-commit
+    # hook, or a repo with no git identity configured (`user.name`/`user.email` unset — an
+    # ordinary operator condition, not exotic), left the write uncommitted while this function
+    # still returned `found=True` unconditionally, EXACTLY the outcome the docstring above says
+    # this mechanism prevents, just reached via a commit-time failure instead of an absent
+    # commit. Reproduced live (adversarial review): (1) a rejecting hook, (2) no git identity —
+    # both leave `generations-index.json` staged-but-uncommitted; the next `triage()` then either
+    # parks forever (HEAD moved) or, if HEAD is unchanged, sweeps the resolution into a `git
+    # stash` and reverts the decision to `"open"` — silently destroying the operator's answer.
+    # Fix, defense in depth:
+    #   (a) `committed` on the returned result distinguishes this outcome so callers can never
+    #       mistake it for an ordinary clean resolution (see cli.py/notify.py's Telegram reply).
+    #   (b) the JSON write itself already succeeded — `blocking_decisions()` is unblocked
+    #       immediately regardless of the commit outcome, so a stalled commit never re-blocks a
+    #       resolved decision.
+    #   (c) `triage()`'s own dirty-tree stash gate independently exempts a lone, uncommitted
+    #       `ownerDecisions[].status` diff on `generations-index.json` (see
+    #       `_is_index_only_owner_decision_dirt()`) — so even if THIS commit attempt fails here
+    #       AND every later automatic retry (a permanently unset identity) also fails, the
+    #       resolution can never be swept into a stash. That exemption is what makes (a)/(b)
+    #       actually sufficient rather than merely best-effort.
+    add_result = _git(repo, "add", "--", str(path))
+    committed = False
+    if add_result.returncode == 0:
+        commit_result = _git(
+            repo,
+            "commit",
+            "-m",
+            f"claude-relay: resolve ownerDecision {decision_id}",
+            "--",
+            str(path),
+        )
+        committed = commit_result.returncode == 0
+
+    return ResolveResult(found=True, decision=found_decision, index_path=path, committed=committed)
 
 
 def _now_iso() -> str:

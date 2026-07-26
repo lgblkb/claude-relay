@@ -99,7 +99,12 @@ class Config:
 
     # [gadkit]
     gadkit_tier: str = "budget"  # gad-kit calls this its --profile flag; see gadkit.py docstring
-    gadkit_extra_flags: list[str] = dataclasses.field(default_factory=list)
+    # NOTE: there is deliberately no `extra_flags` knob (removed 2026-07-26). It was dead config:
+    # `Plan.extra_flags` was populated by triage() and never read by `gadkit.command()`, and it
+    # could not have worked as documented anyway — command() builds a `Workflow({scriptPath, args})`
+    # JSON OBJECT, so the things it advertised ("--milestone", "--skip-premortem") would have to be
+    # `milestone: true` / `skipPreMortem: true` args KEYS, not CLI flag strings. Inventing that
+    # replacement is a separate decision; do not re-add a flag list.
 
     # [plugins].dirs — OPT-IN plugin names/paths exposed to every headless run as `--plugin-dir`.
     # Default empty: gad-kit needs NO per-seat plugin (it runs by absolute path + built-in tools).
@@ -148,6 +153,66 @@ class Config:
         return sorted(names)
 
 
+def _to_float(raw_value: Any, field: str) -> float:
+    """B30 audit fix: a malformed numeric TOML value (wrong type, non-numeric string) used to
+    raise a bare `ValueError` straight out of `load_config()` — unhelpful and inconsistent with
+    every OTHER config problem in this module, which raises `ConfigError`. Wraps the coercion
+    with a message naming the actual offending field and value.
+    """
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field} must be a number, got {raw_value!r}") from exc
+
+
+def _to_int(raw_value: Any, field: str) -> int:
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field} must be an integer, got {raw_value!r}") from exc
+
+
+def _validate(cfg: Config) -> None:
+    """B30 audit fix: numeric config values were never sanity-checked at all, so a typo could
+    silently wreck unattended operation rather than fail loudly at startup:
+      - `run_timeout_s = 0` (or negative) makes `runner.run()`'s very first deadline check see
+        `remaining <= 0` immediately — EVERY run "times out" having never given the child a
+        chance, burning the whole fleet into repeated timeout-cooldowns doing zero real work.
+      - `start_margin > ceiling_pct` makes `start_cap = ceiling_pct - start_margin` negative,
+        so `percent < start_cap` (a real percent is never negative) can never be satisfied —
+        `pick_seat()` would never select ANY seat, ever, silently, and B2's all-exhausted-forever
+        stall follows even though every seat is individually healthy.
+      - `poll_ttl <= 0` would make every single seat check re-poll the live endpoint on every
+        call — the endpoint's own self-rate-limit then turns nearly every read into a 429.
+    Applies to every per-seat `ceiling_pct` override too (`[seats.<name>]` and CLI `--ceiling`),
+    since `resolve_seat_ceiling()` can return any of them.
+    """
+    if cfg.run_timeout_s <= 0:
+        raise ConfigError(f"run_timeout_s must be > 0, got {cfg.run_timeout_s!r}")
+    if cfg.poll_ttl <= 0:
+        raise ConfigError(f"poll_ttl must be > 0, got {cfg.poll_ttl!r}")
+    if cfg.max_units < 0:
+        raise ConfigError(f"max_units must be >= 0 (0 = unlimited), got {cfg.max_units!r}")
+    if not (0.0 < cfg.ceiling_pct <= 100.0):
+        raise ConfigError(f"[defaults].ceiling_pct must be in (0, 100], got {cfg.ceiling_pct!r}")
+    if cfg.start_margin < 0.0:
+        raise ConfigError(f"[defaults].start_margin must be >= 0, got {cfg.start_margin!r}")
+    if cfg.ceiling_pct - cfg.start_margin <= 0.0:
+        raise ConfigError(
+            f"[defaults].start_margin ({cfg.start_margin!r}) must be < ceiling_pct "
+            f"({cfg.ceiling_pct!r}) — otherwise no seat's percent can ever be low enough to "
+            "start a fresh unit on, and the pool silently never runs anything"
+        )
+    for name, seat_cfg in cfg.seat_configs.items():
+        if seat_cfg.ceiling_pct is not None and not (0.0 < seat_cfg.ceiling_pct <= 100.0):
+            raise ConfigError(
+                f"[seats.{name}].ceiling_pct must be in (0, 100], got {seat_cfg.ceiling_pct!r}"
+            )
+    for name, pct in cfg.ceiling_overrides.items():
+        if not (0.0 < pct <= 100.0):
+            raise ConfigError(f"--ceiling {name}={pct!r} must be in (0, 100]")
+
+
 def _read_toml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -183,20 +248,20 @@ def load_config(
     if "exclude" in raw and isinstance(raw["exclude"], list):
         cfg.exclude = [str(x) for x in raw["exclude"]]
     if "poll_ttl" in raw:
-        cfg.poll_ttl = float(raw["poll_ttl"])
+        cfg.poll_ttl = _to_float(raw["poll_ttl"], "poll_ttl")
     if "token_target" in raw:
         cfg.token_target = str(raw["token_target"])
     if "max_units" in raw:
-        cfg.max_units = int(raw["max_units"])
+        cfg.max_units = _to_int(raw["max_units"], "max_units")
     if "run_timeout_s" in raw:
-        cfg.run_timeout_s = float(raw["run_timeout_s"])
+        cfg.run_timeout_s = _to_float(raw["run_timeout_s"], "run_timeout_s")
 
     defaults = raw.get("defaults") or {}
     if isinstance(defaults, dict):
         if "ceiling_pct" in defaults:
-            cfg.ceiling_pct = float(defaults["ceiling_pct"])
+            cfg.ceiling_pct = _to_float(defaults["ceiling_pct"], "[defaults].ceiling_pct")
         if "start_margin" in defaults:
-            cfg.start_margin = float(defaults["start_margin"])
+            cfg.start_margin = _to_float(defaults["start_margin"], "[defaults].start_margin")
         if "adopt_default" in defaults:
             mode = str(defaults["adopt_default"]).strip().lower()
             cfg.adopt_default = mode if mode in ("always", "if-empty", "never") else "always"
@@ -207,7 +272,11 @@ def load_config(
             if not isinstance(seat_table, dict):
                 continue
             cfg.seat_configs[str(seat_name)] = SeatConfig(
-                ceiling_pct=float(seat_table["ceiling_pct"]) if "ceiling_pct" in seat_table else None,
+                ceiling_pct=(
+                    _to_float(seat_table["ceiling_pct"], f"[seats.{seat_name}].ceiling_pct")
+                    if "ceiling_pct" in seat_table
+                    else None
+                ),
                 exclude=bool(seat_table.get("exclude", False)),
                 main=bool(seat_table.get("main", False)),
             )
@@ -216,8 +285,6 @@ def load_config(
     if isinstance(gadkit, dict):
         if "tier" in gadkit:
             cfg.gadkit_tier = str(gadkit["tier"])
-        if "extra_flags" in gadkit and isinstance(gadkit["extra_flags"], list):
-            cfg.gadkit_extra_flags = [str(x) for x in gadkit["extra_flags"]]
 
     plugins_raw = raw.get("plugins") or {}
     if isinstance(plugins_raw, dict) and isinstance(plugins_raw.get("dirs"), list):
@@ -259,7 +326,9 @@ def load_config(
             # here (bin/claude-relay parses each "name=pct" token before calling us) — merge
             # rather than replace so CLI overrides never wipe an already-resolved dict.
             if isinstance(value, dict):
-                cfg.ceiling_overrides.update({str(k): float(v) for k, v in value.items()})
+                cfg.ceiling_overrides.update(
+                    {str(k): _to_float(v, f"--ceiling {k}") for k, v in value.items()}
+                )
             continue
         if hasattr(cfg, key):
             setattr(cfg, key, value)
@@ -270,5 +339,7 @@ def load_config(
             "(gad-kit's slash command flag is --profile; claude-relay calls this a 'tier' "
             "internally to avoid the name collision — see DESIGN.md header)."
         )
+
+    _validate(cfg)
 
     return cfg

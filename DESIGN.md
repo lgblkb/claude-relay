@@ -61,7 +61,14 @@ required token-target directive; recorded confirmed smoke tests + the canonical-
    in-session.
 2. **Disk + usage endpoint decide "what next"; model prose is never parsed** for outcome
    classification. stdout/stream-json is for the live monitor and a backstop signal only.
-   (Refined: disk-truth requires an *artifact census*, not a dirty-tree boolean — §5.)
+   (Refined: disk-truth requires an *artifact census*, not a dirty-tree boolean — §5.) A
+   narrower carve-out (2026-07-26, Blocker 1): `--output-format stream-json` is real NDJSON —
+   `detector.py` decodes it (never bare-substring-matches the raw lines, which is not what
+   production ever produces) and treats exactly two DECODED signals as authoritative even when
+   the usage poll succeeded, because both are structured platform data, not model prose: a
+   `rate_limit_event` envelope's `rate_limit_info`, and gad-run's own `RESULT:` line content
+   (a diagnosis gad-run itself reached via a second agent call). Everything else stays
+   prose-backstop-only, gated on the usage poll having failed.
 3. **Graceful degradation is normal.** Usable pool = discovered ∩ has-usable-creds ∩
    not-in-cooldown, recomputed each iteration. Runs on whatever's available (3/1/0 seats);
    re-checks so a re-logged-in seat rejoins automatically. Logged-out seats are skipped +
@@ -162,6 +169,14 @@ Phase 2 because it needs sound per-unit cost calibration, which v1 does not have
   needed. Phase 2 batching will derive per-unit cost from the **structured token-usage
   fields** Claude Code emits in `--output-format stream-json` (immune to window
   semantics; not "prose"), guarded to discard any sample where `resets_at` changed.
+  **Confirmed present (2026-07-26 live probe, RECORDED not built — Blocker 1 item 5):** the
+  terminal `result` NDJSON envelope (`{"type":"result","subtype":"success",...}`) carries
+  `modelUsage` and `api_error_status` alongside `is_error`/`num_turns`/`duration_ms` — these are
+  exactly the structured token-cost fields this calibration needs, already decodable via
+  `detector.py`'s `_iter_envelopes()` seam (built for the NDJSON tail-parsing rewrite below).
+  Not implemented: Phase 2 still needs to read `result.modelUsage` per invocation, correlate it
+  against the generation actually committed, and derive the per-unit cost — this note only
+  records where the raw data lives so that work has a starting point.
 
 ## 5. gad-kit brain: triage, outcome & the recovery-routing fix (`gadkit.py`)
 
@@ -191,12 +206,30 @@ this. So triage must be artifact-aware and default to the safe path.
    --max 1 --tier budget <TOKEN_TARGET>)`.
 5. Clean tree, backlog exhausted → `DONE`.
 
+**REFUSED-status fix (2026-07-26, gad-kit's uncommitted 2.1.0 work):** step 3's "Guardrails/
+tests completed" proof now requires TWO artifacts, not one — `reviews/verification.md` AND
+`reviews/adversarial-review.md`. gad-generation.js's Guardrails phase treats the adversarial-
+reviewer/results-skeptic as ADVISORY for non-ideation genTypes (a dead reviewer after retries
+still lets Verify run, writing verification.md alone), but gad-finish.js now MECHANICALLY
+REFUSES (`status: 'REFUSED'`, writes nothing) to resume exactly that generation. Requiring both
+files closes the resulting livelock (FINISH → REFUSED → retry identically → HARD_ERROR) without
+ever narrowing what a genuinely resumable ideation generation looks like (its one hard-required
+guardrail call IS the one that writes both files together). See `gadkit.py`'s
+`_ADVERSARIAL_REVIEW_RELATIVE` for the full reasoning; `detector.py`'s `classify()` also treats a
+`REFUSED` RESULT status as non-retryable (defense in depth, for whenever this gate is somehow
+still wrong).
+
 **command(plan):** builds the argv:
 `["-p","--dangerously-skip-permissions","--output-format","stream-json", <slash+flags+token-target>]`
-The slash text MUST include an explicit **token-target directive** (feasibility #4 — e.g.
-the `+2M`-style directive gad-run's own docs require for long turns) so a full generation
-doesn't die on an undocumented per-turn ceiling. Exact directive syntax to confirm on the
-first real run.
+The slash text includes a **token-target directive** (e.g. `+2M`) appended as free prompt
+text. **B22 audit fix (2026-07-26), docs-only:** this was previously documented as a working
+pacing mechanism ("so a full generation doesn't die on an undocumented per-turn ceiling").
+VERIFIED LIVE against the installed `claude` 2.1.220 bundle: `budget.total` (the field
+gad-run.js reads to self-pace) has no writer anywhere in the bundle and is always `null`
+regardless of this directive's phrasing — it is currently inert prompt text, not a real
+per-turn budget. It is kept (harmless either way, and a future CLI version may wire it up)
+but must not be relied on; `--max 1` is what actually bounds each `claude-relay`-launched
+invocation.
 
 **snapshot / outcome:** snapshot = `{HEAD, nextGen, artifact fingerprint}`. outcome()
 classifies from pre/post disk + post-run usage into a **richer set** (feasibility #5):
@@ -252,7 +285,8 @@ v1 — calibration deferred to Phase 2 per §4.)
 repo       = "/abs/path"          # or CLI arg
 exclude    = ["yerasyl"]          # profile-name fragments never used by automation
 poll_ttl   = 90
-token_target = "+2M"             # directive appended to run prompt (verify on 1st run)
+token_target = "+2M"             # directive appended to run prompt — VERIFIED INERT (§5, B22): the
+                                  # installed CLI never populates budget.total; kept, not relied on
 max_units  = 0                    # 0 = until DONE
 [defaults] ceiling_pct = 70; start_margin = 5    # synthetic 5h ceiling for all pool seats
 [seats.almas] ceiling_pct = 70                    # per-seat override; --ceiling to override at runtime

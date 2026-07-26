@@ -206,8 +206,9 @@ claude-relay at a config.toml written by an untrusted or remote source.
 By default, events (`AWAITING_HUMAN`, `BLOCKED`, `DONE`, all-seats-exhausted, hard errors) are
 pushed to Telegram. Reply `resolve <id> <answer>` or `status` in that chat, or run
 `claude-relay resolve <id> <answer>` over SSH — both go through the exact same durable disk
-edit (`.gad/generations-index.json`'s matching `ownerDecisions[]` entry marked `"resolved"`),
-which is what actually unblocks the parked repo (not a chat reply).
+edit (`.gad/generations-index.json`'s matching `ownerDecisions[]` entry marked
+`status: "answered"` — gad-kit's only unblocking token), which is what actually unblocks the
+parked repo (not a chat reply).
 
 ## Monitoring
 

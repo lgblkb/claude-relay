@@ -17,6 +17,7 @@ which is redacted before ever appearing in a log line.
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import subprocess
@@ -64,7 +65,11 @@ def send_telegram(bot_token: str, chat_id: str, text: str, timeout: float = 15.0
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
             response.read()
         return True
-    except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        # B7 audit fix: a READ-phase failure (mid-stream RST, read timeout, malformed status
+        # line) can raise a raw `TimeoutError`/`ConnectionResetError`/`http.client.BadStatusLine`
+        # instead of `URLError` — none of which this function's "never raises" contract excluded
+        # before. Caught here alongside the documented pair so nothing escapes (Invariant #3).
         print(f"[claude-relay] telegram sendMessage failed ({_redact(url)}): {exc}", file=sys.stderr)
         return False
 
@@ -81,7 +86,16 @@ def get_updates(bot_token: str, offset: int, timeout: float = 5.0) -> list[dict[
     try:
         with urllib.request.urlopen(request, timeout=timeout + 10) as response:  # noqa: S310
             body = json.load(response)
-    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError) as exc:
+    except (
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        json.JSONDecodeError,
+        OSError,
+        http.client.HTTPException,
+    ) as exc:
+        # B7 audit fix: see `send_telegram`'s comment — a read-phase failure here previously
+        # escaped raw and would have crash-looped the Telegram poller (and, via `loop.run`'s
+        # missing top-level guard, the whole supervisor).
         print(f"[claude-relay] telegram getUpdates failed ({_redact(url)}): {exc}", file=sys.stderr)
         return []
     if not isinstance(body, dict) or not body.get("ok"):
@@ -124,7 +138,8 @@ def _dispatch_webhook(config: Config, message: str) -> bool:
         with urllib.request.urlopen(request, timeout=15) as response:  # noqa: S310
             response.read()
         return True
-    except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        # B7 audit fix: same read-phase-failure gap as `send_telegram`.
         print(f"[claude-relay] notify webhook failed: {exc}", file=sys.stderr)
         return False
 
@@ -262,10 +277,20 @@ def poll_telegram_updates(
             if result.found:
                 question = (result.decision or {}).get("question", "")
                 reply = f"resolved {decision_id}: {question}"
+                if not result.committed:
+                    # B13 audit fix, second round: the JSON write applied (the repo IS unblocked
+                    # already) but the resolution's own git commit failed — a rejecting
+                    # pre-commit hook or missing git identity in the repo. The reply must NEVER
+                    # read as an ordinary clean resolution when this happens.
+                    reply += (
+                        " -- WARNING: applied but the commit FAILED (check the repo's git "
+                        "identity / pre-commit hooks); claude-relay will keep retrying "
+                        "automatically, but consider committing it by hand."
+                    )
             else:
                 reply = f"no open ownerDecision with id={decision_id!r} found in {result.index_path}"
             send_telegram(config.telegram_bot_token, config.telegram_chat_id, reply)
-            processed.append(f"resolve {decision_id} -> found={result.found}")
+            processed.append(f"resolve {decision_id} -> found={result.found} committed={result.committed}")
             continue
 
         if _STATUS_RE.match(text):

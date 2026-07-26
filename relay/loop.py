@@ -31,10 +31,14 @@ _LONG_WAIT_NOTIFY_S = 300.0  # notify the operator if an all-seats wait exceeds 
 _SLEEP_CHUNK_S = 30.0  # bounded sleep chunks so the loop can save state/poll telegram
 _PARK_RETRIAGE_INTERVAL_S = 60.0
 _DEFAULT_RETRY_WAIT_S = 90.0  # fallback wait when no seat gives us a parseable resets_at
-# Forced cooldown applied to a seat whose `claude` invocation timed out (runner.py's
-# run_timeout_s) — a hung session tells us nothing about the seat's real usage, but we must
-# still rotate away from it (finding #7) rather than immediately re-selecting the same seat.
-# Guessed value, not empirically tuned — see uncertainty-ledger.jsonl.
+# Forced cooldown applied by `_force_cooldown()` to a seat whose run's outcome is untrustworthy
+# as a usage signal: either the `claude` invocation timed out (runner.py's run_timeout_s — a
+# hung session tells us nothing about the seat's real usage, finding #7), or (A1 audit fix) the
+# run was classified AGENT_DEAD_NONLIMIT/CONTINUE_ROTATE via the probe-confirmed workflow-limit
+# signature or the usage-unavailable backstop — a bucket that, by construction, never got a
+# cooldown from the normal `_record_usage()`/`rotate_off()` path. Either way we must still
+# rotate away from the seat rather than immediately re-selecting it. Guessed value, not
+# empirically tuned — see uncertainty-ledger.jsonl.
 _TIMEOUT_COOLDOWN_S = 900.0
 
 
@@ -102,12 +106,16 @@ class SingleInstanceLock:
         return self._read_lock_contents()[0]
 
     def _is_stale(self) -> bool:
-        try:
-            age = time.time() - self.path.stat().st_mtime
-        except OSError:
-            return True
-        if age > self.stale_after_s:
-            return True
+        """B1 audit fix (reordered): liveness + start-time corroboration decide FIRST; the mtime
+        AGE check is only a fallback for the one case neither can settle (non-Linux, or a /proc
+        read race). The prior order checked age BEFORE liveness and short-circuited on it, so a
+        healthy multi-day crawl (the exact workload this tool exists for) became unconditionally
+        "stale" the moment it crossed `stale_after_s`, regardless of whether the holding process
+        was still alive — reproduced with two concurrent instances. Pairs with `heartbeat()`
+        (called once per outer loop iteration and per sleep/park chunk): a genuinely live
+        instance's lock mtime is now refreshed far more often than `stale_after_s`, so the age
+        fallback below only ever fires for a lock nothing is actively renewing.
+        """
         pid, recorded_starttime = self._read_lock_contents()
         if pid is None:
             return True
@@ -124,7 +132,15 @@ class SingleInstanceLock:
         current_starttime = _proc_start_time(pid)
         if recorded_starttime is not None and current_starttime is not None:
             return current_starttime != recorded_starttime
-        return False  # can't corroborate (non-Linux, or /proc read failed) — fall back to alive
+        # Can't corroborate via /proc (non-Linux, or the read raced/failed) — liveness alone
+        # said the PID is alive, but PID reuse within the stale window could fool that too.
+        # Fall back to the mtime age as the ONLY remaining signal, in this uncorroborated case
+        # exclusively.
+        try:
+            age = time.time() - self.path.stat().st_mtime
+        except OSError:
+            return True
+        return age > self.stale_after_s
 
     def acquire(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,12 +165,60 @@ class SingleInstanceLock:
             f.write(f"{my_pid}:{my_starttime if my_starttime is not None else ''}")
         self._acquired = True
 
+    def heartbeat(self) -> None:
+        """Refresh the lockfile's mtime (B1 audit fix). Previously mtime was written exactly
+        once, in `acquire()`, and never touched again — so `_is_stale()`'s age check made ANY
+        run longer than `stale_after_s` (default 6h) unconditionally reclaimable, regardless of
+        whether the holding process was still alive. Call this once per outer loop iteration
+        AND once per sleep/park-poll chunk (`_sleep_and_poll()`/`_park_and_wait()` already loop
+        every 30-60s to save state and poll Telegram — piggyback on that cadence) so a healthy
+        instance's lock never goes more than about a minute without being renewed. No-op if we
+        don't currently hold the lock.
+
+        Uncertainty a reviewer should check (2026-07-26 review, recorded not fixed): this is
+        NEVER called from INSIDE a single `run_once()` invocation — that call blocks
+        synchronously on `runner.run()` for up to `config.run_timeout_s` (default 2h) with no
+        heartbeat in between. On Linux this is harmless: `_is_stale()` checks liveness +
+        `/proc`-start-time corroboration FIRST, and a live process passes that check regardless
+        of how stale the mtime has gotten, so the age fallback below is never reached at all for
+        a genuinely running instance. On a non-Linux host (where `_proc_start_time()` always
+        returns `None`, per its own docstring), that corroboration is unavailable — liveness
+        (`os.kill(pid, 0)`) alone cannot distinguish "our own live long-running instance" from
+        "PID reuse," so `_is_stale()` falls through to the mtime AGE check as the SOLE signal,
+        and a single `run_once()` longer than `stale_after_s` could then be wrongly reclaimed on
+        such a host. Not reproduced (this environment is Linux); flagged as a known gap rather
+        than fixed, since closing it would need heartbeating from inside `runner.run()`'s own
+        read loop (a cross-module coupling out of this round's scope).
+        """
+        if not self._acquired:
+            return
+        try:
+            os.utime(self.path, None)
+        except OSError:
+            pass
+
     def release(self) -> None:
         if self._acquired:
-            try:
-                self.path.unlink()
-            except OSError:
-                pass
+            # B1 audit fix: verify the file still names US (pid AND, when available, start-time)
+            # before unlinking. Previously `release()` unlinked unconditionally — if this
+            # instance's OWN stale-reclaim window had already elapsed (e.g. a long GC pause, or
+            # simply the old age-first `_is_stale()` bug) and a second instance reclaimed the
+            # lock in the meantime, this instance's own `release()` on exit would then delete
+            # the SECOND instance's lock out from under it, letting a third instance start
+            # concurrently with the second. Our own PID can never legitimately collide with
+            # itself, so a pid mismatch alone is conclusive; a start-time mismatch (when both
+            # sides are readable) is treated the same way, defensively.
+            pid, recorded_starttime = self._read_lock_contents()
+            still_ours = pid == os.getpid()
+            if still_ours and recorded_starttime is not None:
+                current_starttime = _proc_start_time(os.getpid())
+                if current_starttime is not None and current_starttime != recorded_starttime:
+                    still_ours = False  # shouldn't happen for our own live PID; stay conservative
+            if still_ours:
+                try:
+                    self.path.unlink()
+                except OSError:
+                    pass
             self._acquired = False
 
     def __enter__(self) -> SingleInstanceLock:
@@ -207,6 +271,23 @@ def _record_usage(
     )
 
 
+# B8 audit fix: a seat whose usage-endpoint poll fails with HTTP 401 (token present but
+# rejected) can ONLY recover via a `claude` launch — that's what refreshes its token
+# (runner.py's module docstring, confirmed live) — but a 401 poll failure is a `UsageError`
+# like any other, and `pick_seat()` used to lump it into the generic "usage-poll-failed" skip,
+# which declines the one launch that would fix it. Left unfixed, seats age out one at a time
+# until the whole pool is 401'd (feeding B2's all-exhausted stall) with zero notification ever.
+# Policy (a deliberate choice among the audit's two named options — this combines both): give a
+# 401 seat up to `_MAX_AUTH_REFRESH_ATTEMPTS` bounded chances to be selected anyway, purely so
+# the next `claude` launch can refresh its token — but ONLY as a last resort (never outcompeting
+# a seat with a genuine live reading, so a speculative refresh-launch can't starve healthy work).
+# Past the budget, stop offering it (an indefinitely-dead refresh_token would otherwise be
+# retried forever) and notify the operator once that manual re-login is needed; a successful poll
+# at ANY time afterward (automated recovery within budget, or the operator manually re-logging in
+# after exhaustion) resets the counter and clears the notification, so this converges either way.
+_MAX_AUTH_REFRESH_ATTEMPTS = 3
+
+
 def pick_seat(
     seats: list[fleet.Seat],
     state: dict[str, Any],
@@ -221,10 +302,15 @@ def pick_seat(
     their captured resets_at, no polling"). `ceiling_pct` is the SYNTHETIC per-seat rotation
     ceiling (default 70%, config.py `resolve_seat_ceiling()`) — deliberately lower than
     Claude's real 100%, and resolved per-seat so different seats can carry different ceilings.
+
+    See the `_MAX_AUTH_REFRESH_ATTEMPTS` comment above for the B8 401-recovery policy: a seat
+    within its bounded retry budget is offered as a LAST-RESORT candidate (returned with
+    `usage=None`) only when no seat with a genuine live reading is available.
     """
     notes: list[str] = []
     disabled = cooldown.disabled_seats(state)
     candidates: list[tuple[fleet.Seat, usage_mod.UsageSnapshot]] = []
+    auth_refresh_candidates: list[fleet.Seat] = []
     for seat in seats:
         if seat.name in disabled:
             notes.append(f"disabled: {seat.name}")
@@ -241,8 +327,35 @@ def pick_seat(
             notes.append(f"needs-login: {seat.name}")
             continue
         except usage_mod.UsageError as exc:
+            if usage_mod.is_auth_error(exc):
+                attempts = int(cooldown.get_seat_state(state, seat.path).get("consecutiveFailures", 0)) + 1
+                cooldown.update_seat(state, seat.path, consecutive_failures=attempts)
+                if attempts > _MAX_AUTH_REFRESH_ATTEMPTS:
+                    notes.append(f"auth-exhausted: {seat.name} ({attempts} consecutive 401s)")
+                    # Not force=True: this must fire once, then stay deduped (mirrors the
+                    # needs-login pattern) — the failure recurs every iteration a permanently
+                    # dead refresh_token keeps 401ing, and force=True here would spam.
+                    notify.notify(
+                        config,
+                        state,
+                        f"auth-exhausted:{seat.path}",
+                        f"claude-relay: seat {seat.name} has failed usage-endpoint auth "
+                        f"{attempts} times in a row (HTTP 401) and will no longer be "
+                        f"auto-retried via launch. Log in again manually for this seat "
+                        f"(CLAUDE_CONFIG_DIR={seat.path}) to restore it to the pool.",
+                    )
+                else:
+                    notes.append(
+                        f"auth-refresh-attempt: {seat.name} ({attempts}/{_MAX_AUTH_REFRESH_ATTEMPTS})"
+                    )
+                    auth_refresh_candidates.append(seat)
+                continue
             notes.append(f"usage-poll-failed: {seat.name}: {exc}")
             continue
+        # A live 200 proves the token is fine again — reset the 401 streak and let a NEW streak
+        # (if this seat ever 401s again later) notify again rather than staying deduped forever.
+        cooldown.update_seat(state, seat.path, consecutive_failures=0)
+        cooldown.clear_notified(state, f"auth-exhausted:{seat.path}")
         ceiling = config.resolve_seat_ceiling(seat.name)
         _record_usage(state, seat, seat_usage, ceiling)
         if usage_mod.rotate_off(seat_usage, ceiling):
@@ -256,6 +369,8 @@ def pick_seat(
             notes.append(f"above-start-cap: {seat.name} ({percent}% >= {start_cap}%)")
 
     if not candidates:
+        if auth_refresh_candidates:
+            return auth_refresh_candidates[0], None, notes
         return None, None, notes
 
     # Spend PERISHABLE capacity first (DESIGN.md §4): among seats that pass the start-cap gate,
@@ -268,7 +383,19 @@ def pick_seat(
 
     def _sort_key(pair: tuple[fleet.Seat, usage_mod.UsageSnapshot]) -> tuple[float, float]:
         resets = usage_mod.session_resets_at(pair[1])
-        seconds_to_reset = (resets - now).total_seconds() if resets is not None else float("inf")
+        # B11 audit fix: floor at zero. `resets` can be a STALE/pinned reading (see
+        # `UsageCache.extra_ttl_s`) that is already in the past by the time this sorts — an
+        # unfloored `(resets - now)` goes NEGATIVE, which then sorts BEFORE every genuinely
+        # imminent seat under "spend perishable capacity first," inverting the very policy this
+        # sort implements (a stale snapshot is the least trustworthy signal, not the most urgent).
+        seconds_to_reset = (
+            max(0.0, (resets - now).total_seconds()) if resets is not None else float("inf")
+        )
+        # Uncertainty a reviewer should check: this floor fixes RELATIVE staleness ranking among
+        # MULTIPLE past-due entries (the most-stale one no longer sorts first among them) — it
+        # does NOT guarantee "a stale reading never beats a genuinely-future one." Two floored-
+        # to-zero seats tie on `seconds_to_reset`, so the percent tie-break decides, which could
+        # still let a stale-but-low-percent seat outrank a real-but-imminent higher-percent one.
         return (seconds_to_reset, usage_mod.session_percent(pair[1]))
 
     candidates.sort(key=_sort_key)
@@ -277,20 +404,64 @@ def pick_seat(
 
 
 def _earliest_wait(seats: list[fleet.Seat], state: dict[str, Any]) -> dt.datetime | None:
+    """The soonest time among usable, non-disabled seats that could plausibly become selectable
+    again on their own: a disabled seat's timing alone should never dictate what we sleep for
+    (there is no automatic path back to usable), and a timestamp that has already elapsed is not
+    a real future wait at all.
+
+    B2 audit fix: this used to take `min()` over EVERY seat's `cooldownUntil` verbatim — with no
+    "usable" exclusion for disabled seats and, crucially, no check that the timestamp was still
+    in the future. A stale/past `cooldownUntil` (a disabled seat's old reading, a poll-failed
+    seat's last-known value, or simple clock skew) then fed `_wait_seconds()` a non-positive
+    delta, which `_sleep_and_poll()`'s `while remaining > 0:` treats as "nothing to sleep" —
+    a zero-sleep busy loop that also stops Telegram polling (since that only happens INSIDE the
+    sleep chunks) and suppresses the long-wait notification (`0 < _LONG_WAIT_NOTIFY_S`).
+
+    B9 audit fix: a seat sitting in the "dead band" between `start_cap` and `ceiling_pct` (below
+    the rotate-off ceiling, but above the start-cap margin `pick_seat()` requires to actually
+    select it) never gets a `cooldownUntil` at all — `rotate_off()` is false by construction, so
+    `_record_usage()` never sets one. If EVERY usable seat is simultaneously in this dead band,
+    the old cooldown-only version returned `None` here regardless, which `_wait_seconds()` turns
+    into the bare ~90s default retry wait — a silent poll storm (400 usage polls per 5h window,
+    each with a full `triage()`) that also stays under `_LONG_WAIT_NOTIFY_S`, so the operator
+    never hears about it. `pick_seat()` records `lastResetsAt` for EVERY seat it successfully
+    polls, dead-band or not (see `_record_usage()`), so that reading — the seat's own 5h window
+    reset, a real future time after which its percent very plausibly drops back under the start
+    cap — is now ALSO a candidate wait target, not just an explicit `cooldownUntil`.
+    """
+    now = dt.datetime.now(dt.UTC)
+    disabled = cooldown.disabled_seats(state)
     candidates: list[dt.datetime] = []
     for seat in seats:
-        if not seat.usable:
+        if not seat.usable or seat.name in disabled:
             continue
         entry = cooldown.get_seat_state(state, seat.path)
-        until = entry.get("cooldownUntil")
-        if not until:
-            continue
-        try:
-            parsed = dt.datetime.fromisoformat(str(until).replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        candidates.append(parsed)
+        for raw in (entry.get("cooldownUntil"), entry.get("lastResetsAt")):
+            if not raw:
+                continue
+            try:
+                parsed = dt.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.UTC)
+            if parsed <= now:
+                continue  # already elapsed — mirrors is_in_cooldown()'s own `now < until_dt` check
+            candidates.append(parsed)
     return min(candidates) if candidates else None
+
+
+# B2 fix: a floor so a cooldown that is technically still in the future but only by a hair (a
+# race between _earliest_wait()'s `now` and this function's own `now`, or a resets_at a few
+# milliseconds out) can never compute to an effectively-zero sleep and spin the loop hot.
+_MIN_WAIT_S = 5.0
+# B17 fix: a ceiling so a legitimately distant `cooldownUntil` (a weekly-limit reset can be up to
+# ~7 days out — see usage.py's `earliest_reset()`) or an outright-corrupt one (bad RTC, garbage
+# `resets_at`) never turns into a single multi-day-or-longer sleep. Capping here (rather than
+# only in `clamp_future()`) means the loop always re-polls Telegram / re-checks seat state at
+# least this often regardless of WHY the wait looked long, closing the "parks the supervisor for
+# up to a year" failure mode DESIGN.md §9 promises clamping against.
+_MAX_WAIT_S = 5.0 * 3600.0
 
 
 def _wait_seconds(wait_until: dt.datetime | None, default_s: float = _DEFAULT_RETRY_WAIT_S) -> float:
@@ -299,7 +470,7 @@ def _wait_seconds(wait_until: dt.datetime | None, default_s: float = _DEFAULT_RE
     now = dt.datetime.now(dt.UTC)
     if wait_until.tzinfo is None:
         wait_until = wait_until.replace(tzinfo=dt.UTC)
-    return max(0.0, (wait_until - now).total_seconds())
+    return max(_MIN_WAIT_S, min(_MAX_WAIT_S, (wait_until - now).total_seconds()))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -335,6 +506,21 @@ def run_once(
     sync_seat_login_state(state, seats)
     seat, _seat_usage, notes = pick_seat(seats, state, cache, config)
     if seat is None:
+        # `triage()` must book a research repo's one-per-HEAD backlog-refill attempt at decision
+        # time (it is the only place holding `state`), but nothing was spent here — every seat is
+        # cooling. Hand the attempt back, or one all-seats-exhausted window would silently consume
+        # it and the next triage would end the crawl with DONE having never invoked gad-run at all.
+        #
+        # A6 audit fix: gated on `plan.ideation_refill` — the plan produced by
+        # `gadkit._exhausted_backlog_plan()`'s ideation branch, and the ONLY plan that actually
+        # booked this attempt. Previously this ran for EVERY no-seat iteration regardless of
+        # which plan triage had just returned (a mid-generation recovery restart, an ordinary
+        # pending-backlog RUN, anything) — wiping a still-binding marker from an entirely
+        # unrelated iteration let the same HEAD be re-attempted for auto-ideation indefinitely,
+        # since the very next no-seat iteration (for whatever plan) would clear it right back out
+        # again the moment triage re-booked it.
+        if plan.ideation_refill:
+            cooldown.clear_ideation_attempt_head(state, repo)
         return IterationResult(
             plan=plan, action=None, seat_notes=notes, wait_until=_earliest_wait(seats, state)
         )
@@ -360,20 +546,71 @@ def run_once(
     if post_usage is not None:
         _record_usage(state, seat, post_usage, ceiling)
 
+    post = gadkit.snapshot(repo)
+    outcome_bucket = gadkit.outcome(pre, post, post_usage, ceiling)
+    action = detector.classify(outcome_bucket, post_usage, result.tail)
+
     if result.timed_out:
         # A hung `claude` process tells us nothing reliable about this seat's real usage — but
         # we must still rotate away from it rather than immediately re-selecting the same seat
         # (finding #7: "the loop treats [a timeout] as rotate/retry"). Force a short cooldown so
         # pick_seat() naturally avoids it next iteration regardless of what outcome() concludes.
-        timeout_cooldown_until = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=_TIMEOUT_COOLDOWN_S)
-        cooldown.update_seat(state, seat.path, cooldown_until=timeout_cooldown_until.isoformat())
+        _force_cooldown(state, seat)
+    elif outcome_bucket == "AGENT_DEAD_NONLIMIT" and action.kind == detector.CONTINUE_ROTATE:
+        # A1 audit fix: `outcome()` can only be AGENT_DEAD_NONLIMIT when `near_cap()` was FALSE
+        # for this seat's own post-run usage reading — i.e. `rotate_off()` is false BY THE
+        # BUCKET'S OWN PREMISE, so the normal cooldown-recording path (`_record_usage()`) never
+        # gave this seat a cooldown. Yet `classify()` still resolved this to CONTINUE_ROTATE,
+        # via either gad-run's own probe-confirmed workflow-limit signature or (when the usage
+        # poll itself failed) the generic tail backstop. Left unpatched, `pick_seat()` would
+        # happily re-select the SAME seat from the SAME (still-headroom-showing) cached reading
+        # next iteration: an uncapped, no-backoff respawn that also bypasses the HARD_ERROR
+        # breaker entirely, since `loop.run()`'s CONTINUE_ROTATE handling resets
+        # `consecutive_agent_dead` to 0 unconditionally with no sleep in between. Force the same
+        # short cooldown the timeout case uses, so this seat is at least rotated away from
+        # rather than hammered; `loop.run()` additionally treats THIS specific flavor of
+        # CONTINUE_ROTATE like RETRY for breaker-counting purposes (see there), since repeated
+        # probe-confirmed deaths across DIFFERENT seats is exactly the "platform outage, not one
+        # bad seat" signature the breaker exists to catch. `action.resets_at` (Blocker 1 item 2)
+        # carries a REAL structured reset time when the rate_limit_event signal produced this
+        # CONTINUE_ROTATE; `_force_cooldown()` prefers it over the blind timeout guess.
+        _force_cooldown(state, seat, resets_at=action.resets_at)
 
-    post = gadkit.snapshot(repo)
-    outcome_bucket = gadkit.outcome(pre, post, post_usage, ceiling)
-    action = detector.classify(outcome_bucket, post_usage, result.tail)
     return IterationResult(
         plan=plan, action=action, seat=seat, run_result=result, outcome=outcome_bucket, seat_notes=notes
     )
+
+
+def _is_genuine_wall_hit_rotation(kind: str, outcome: str | None) -> bool:
+    """True iff this iteration's action is a CONTINUE_ROTATE driven by an ACTUAL usage-near-cap
+    reading (`gadkit.outcome()`'s HIT_WALL bucket) rather than the AGENT_DEAD_NONLIMIT
+    ambiguity's probe-confirmed/backstop override (A1 audit fix). Only the former already has a
+    real, `_record_usage()`-recorded cooldown behind it and represents unambiguous progress
+    toward a fresh seat — HARD_ERROR-breaker resets require that. The latter must count toward
+    the breaker exactly like RETRY, since `run_once()`'s `_force_cooldown()` there is a
+    defensive rotation, not evidence anything actually progressed.
+    """
+    return kind == detector.CONTINUE_ROTATE and outcome == "HIT_WALL"
+
+
+def _force_cooldown(state: dict[str, Any], seat: fleet.Seat, resets_at: str | None = None) -> None:
+    """Force a cooldown onto `seat` regardless of what the live usage reading said — used when a
+    run's outcome is untrustworthy as a usage signal (a hung process, or a probe-confirmed/
+    backstop-inferred wall-hit that the seat's own percent doesn't reflect) but we still must not
+    let `pick_seat()` re-select the same seat next iteration.
+
+    `resets_at` (Blocker 1 item 2, an ISO-8601 UTC string): when a `rate_limit_event` gave us a
+    REAL structured reset time (its `resetsAt` field, via `detector.Action.resets_at`), use that
+    as the actual cooldown boundary instead of the blind `_TIMEOUT_COOLDOWN_S` guess —
+    `cooldown.clamp_future()` still guards against a garbage/implausible value. Falls back to the
+    guess when no `resets_at` is given, or `clamp_future()` rejects it.
+    """
+    clamped = cooldown.clamp_future(resets_at) if resets_at else None
+    if clamped is not None:
+        cooldown.update_seat(state, seat.path, cooldown_until=clamped)
+        return
+    until = dt.datetime.now(dt.UTC) + dt.timedelta(seconds=_TIMEOUT_COOLDOWN_S)
+    cooldown.update_seat(state, seat.path, cooldown_until=until.isoformat())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -443,7 +680,9 @@ def status_report(config: Config, state: dict[str, Any]) -> dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _sleep_and_poll(total_s: float, config: Config, state: dict[str, Any], repo: Path) -> None:
+def _sleep_and_poll(
+    total_s: float, config: Config, state: dict[str, Any], repo: Path, lock: SingleInstanceLock
+) -> None:
     remaining = total_s
     while remaining > 0:
         chunk = min(_SLEEP_CHUNK_S, remaining)
@@ -453,21 +692,46 @@ def _sleep_and_poll(total_s: float, config: Config, state: dict[str, Any], repo:
             config, state, repo, status_provider=lambda: f"claude-relay: waiting on seat cooldowns for {repo}"
         )
         cooldown.save_state(config.state_path, state)
+        # B1 fix: this loop can run for hours (a capped wait is still up to _MAX_WAIT_S, and
+        # this chunk-loop is the ONLY code running during that whole span) — refresh the
+        # lockfile's mtime every chunk so `_is_stale()`'s age fallback never mistakes a live,
+        # merely-waiting instance for a dead one.
+        lock.heartbeat()
 
 
-def _park_and_wait(repo: Path, config: Config, state: dict[str, Any]) -> None:
+def _park_and_wait(
+    repo: Path,
+    config: Config,
+    state: dict[str, Any],
+    lock: SingleInstanceLock,
+    *,
+    notify_key: str | None = None,
+    notify_message: str | None = None,
+) -> None:
     """Block until the repo is no longer AWAITING_HUMAN/BLOCKED, opportunistically polling
     Telegram (so `resolve <id> <answer>` / `status` keep working while parked) and re-triaging
     periodically. Single-repo v1 has no other work to serve while parked (DESIGN.md §11). Uses
     `dry_run=True` (never stashes while merely re-checking a parked repo — the real stash
     decision, if any, happens the next time `run_once()` triages for real) but passes the REAL
     `state` object so clean-baseline bookkeeping legitimately updates while parked.
+
+    B21 audit fix: `notify()` correctly does not mark a key as sent when `dispatch()` fails (a
+    transient Telegram outage, say), but the ORIGINAL park notification was only ever attempted
+    ONCE, right before this function was entered — so a single transient failure lost the park
+    message PERMANENTLY: this loop can run for the entire duration of an AWAITING_HUMAN/BLOCKED
+    park (unbounded), with no other path that ever retries it. `notify_key`/`notify_message`
+    (when given) are retried on every re-triage cycle via the SAME `notify.notify()` call the
+    original send used — its own dedupe (`was_notified`) means this is a genuine no-op once the
+    send has actually succeeded (no re-spam), but keeps trying for as long as it keeps failing.
     """
     while True:
         notify.poll_telegram_updates(
             config, state, repo, status_provider=lambda: f"claude-relay: parked on {repo}"
         )
+        if notify_key is not None and notify_message is not None:
+            notify.notify(config, state, notify_key, notify_message)
         cooldown.save_state(config.state_path, state)
+        lock.heartbeat()  # B1 fix: a park can last indefinitely (AWAITING_HUMAN has no timeout)
         plan = gadkit.triage(repo, config, state, dry_run=True)
         if plan.kind not in ("AWAITING_HUMAN", "BLOCKED"):
             return
@@ -520,6 +784,12 @@ def run(
         units_completed = 0
         try:
             while True:
+                # B1 fix: refresh the lockfile's mtime once per outer iteration too (in addition
+                # to the per-chunk heartbeats inside `_sleep_and_poll()`/`_park_and_wait()`) so a
+                # crawl that never hits either of those (e.g. back-to-back CONTINUE/RETRY
+                # iterations with no waiting at all) still renews it at least once per
+                # `run_once()` call.
+                lock.heartbeat()
                 iteration = run_once(repo, config, state, cache)
                 cooldown.save_state(config.state_path, state)
 
@@ -574,29 +844,56 @@ def run(
                         cooldown.save_state(config.state_path, state)
                     if once:
                         return 0
-                    _sleep_and_poll(wait_s, config, state, repo)
+                    _sleep_and_poll(wait_s, config, state, repo, lock)
                     continue
 
                 kind = iteration.action.kind
-                if kind in (detector.CONTINUE, detector.CONTINUE_ROTATE):
+                if kind == detector.CONTINUE or _is_genuine_wall_hit_rotation(kind, iteration.outcome):
+                    # A genuine wall-hit rotation (outcome() only returns HIT_WALL when the
+                    # seat's OWN usage reading is at/near its ceiling) already got a real
+                    # cooldown recorded by `_record_usage()`/`rotate_off()` — unambiguous
+                    # progress toward a fresh seat, so reset the breaker.
                     consecutive_agent_dead = 0
                     if once:
                         return 0
                     continue
 
-                if kind == detector.RETRY:
+                if kind in (detector.RETRY, detector.CONTINUE_ROTATE):
+                    # A1 audit fix: a CONTINUE_ROTATE reaching here (the HIT_WALL case above
+                    # already `continue`d) is the AGENT_DEAD_NONLIMIT flavor — `run_once()`'s
+                    # `_force_cooldown()` already rotated THIS iteration's seat away, but
+                    # treating it as unconditional "progress" (resetting the breaker to 0, as
+                    # this used to) bypassed the HARD_ERROR breaker entirely: an uncapped,
+                    # no-backoff respawn that could cycle every seat in the pool forever.
+                    # Repeated probe-confirmed/backstop-inferred deaths — however many
+                    # DIFFERENT seats they land on — is exactly the "platform outage, not one
+                    # bad seat" signature this breaker exists to catch, so it counts the same
+                    # as RETRY.
                     consecutive_agent_dead += 1
-                    if consecutive_agent_dead >= _MAX_CONSECUTIVE_AGENT_DEAD:
+                    # Blocker 1 item 3 (E9): `action.no_retry` means detector.classify() already
+                    # determined retrying is KNOWN to be pointless (e.g. gad-run's own RESULT
+                    # reported DIRTY-TREE — it refused to even start) — trip the breaker on THIS
+                    # occurrence rather than wasting `_MAX_CONSECUTIVE_AGENT_DEAD` cycles first.
+                    if iteration.action.no_retry or consecutive_agent_dead >= _MAX_CONSECUTIVE_AGENT_DEAD:
                         # force=True (finding #2): a HARD_ERROR must never be permanently
                         # swallowed by a static dedupe key — the operator needs to see EVERY
                         # occurrence, not just the first one ever.
+                        message = (
+                            f"HARD_ERROR: {repo} received a non-retryable RESULT on the first "
+                            f"attempt (retrying would waste cycles for nothing); parking rather "
+                            f"than burning tokens. Reason: {iteration.action.reason}"
+                            if iteration.action.no_retry
+                            else (
+                                f"HARD_ERROR: {consecutive_agent_dead} consecutive non-limit "
+                                f"failures on {repo}; parking rather than burning tokens in a "
+                                f"crash loop. Last reason: {iteration.action.reason}"
+                            )
+                        )
                         notify.notify(
                             config,
                             state,
                             f"hard-error:{repo}",
-                            f"HARD_ERROR: {consecutive_agent_dead} consecutive non-limit "
-                            f"failures on {repo}; parking rather than burning tokens in a "
-                            f"crash loop. Last reason: {iteration.action.reason}",
+                            message,
                             force=True,
                         )
                         cooldown.save_state(config.state_path, state)
@@ -607,20 +904,60 @@ def run(
 
                 if kind == detector.NOTIFY_PARK:
                     key = _park_notify_key(repo, iteration.plan)
-                    notify.notify(config, state, key, _park_message(repo, iteration.plan))
+                    message = _park_message(repo, iteration.plan)
+                    notify.notify(config, state, key, message)
                     cooldown.save_state(config.state_path, state)
                     if once:
                         return 0
-                    _park_and_wait(repo, config, state)
+                    # B21 audit fix: pass key/message through so a transient send failure gets
+                    # retried on every re-triage cycle instead of being lost for the whole park.
+                    _park_and_wait(repo, config, state, lock, notify_key=key, notify_message=message)
                     consecutive_agent_dead = 0
                     continue
 
                 if kind == detector.DONE:
-                    notify.notify(config, state, f"done:{repo}", f"DONE: {iteration.plan.detail}", force=True)
+                    # B29 audit fix: `iteration.plan.detail` describes the PLAN triage() produced
+                    # (e.g., for the auto-ideation exhaustion path, "handing the exhausted backlog
+                    # to /gad-run ... instead of terminating" — a description of what was ABOUT to
+                    # be attempted), not what actually happened. `iteration.action.reason` is the
+                    # right field in every DONE path: `run_once()` sets it to `plan.detail`
+                    # verbatim for the direct "no run needed" case (so nothing regresses there),
+                    # and to `detector.classify()`'s own "backlog exhausted" for the case where a
+                    # RUN plan was genuinely executed and its post-run `outcome()` came back
+                    # NO_BACKLOG — the actual terminal OUTCOME, not the pre-run plan's own text.
+                    done_message = f"DONE: {iteration.action.reason}"
+                    notify.notify(config, state, f"done:{repo}", done_message, force=True)
                     cooldown.save_state(config.state_path, state)
                     return 0
 
                 print(f"[claude-relay] unrecognized action kind {kind!r}; stopping", file=sys.stderr)
                 return 1
+        except Exception as exc:
+            # B7/B12 audit fix: previously this `try` had a `finally` and NO `except` at all, so
+            # an uncaught exception anywhere in the loop body (a raw network exception escaping
+            # notify.py/usage.py before that fix, `gadkit.gadkit_plugin_root()`'s bare
+            # `FileNotFoundError`, `gadkit.git_stash_push()`'s `GitRecoveryError`, anything else)
+            # unwound straight past every "never raises" contract and killed the supervisor with
+            # ZERO notification — the monitor keeps painting a healthy table (B24) while
+            # supervision has actually stopped. Deliberately `Exception`, not `BaseException`:
+            # `KeyboardInterrupt`/`SystemExit` are the operator's own deliberate action and should
+            # not read as an alarming crash. The notify call itself is best-effort — a failure to
+            # notify must never hide or replace the ORIGINAL exception's traceback.
+            try:
+                notify.notify(
+                    config,
+                    state,
+                    f"crash:{repo}",
+                    f"claude-relay CRASHED on {repo}: {exc!r}. Supervision has STOPPED — "
+                    "it will not resume until the process is restarted.",
+                    force=True,
+                )
+            except Exception as notify_exc:  # pragma: no cover - defensive: must never mask a crash
+                print(
+                    f"[claude-relay] failed to send crash notification (original error: {exc!r}): "
+                    f"{notify_exc!r}",
+                    file=sys.stderr,
+                )
+            raise
         finally:
             cooldown.save_state(config.state_path, state)
