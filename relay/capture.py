@@ -103,6 +103,7 @@ _STATE = _State()
 def reset_for_tests() -> None:
     """Drop memoized state so a test can re-resolve against a different env var value."""
     _STATE.reset()
+    _EXPLICIT_PATHS.clear()
 
 
 def _resolve() -> Path | None:
@@ -142,8 +143,55 @@ def disabled_reason() -> str | None:
     return _STATE.disabled_reason
 
 
+# Per-directory capture files for `record_to()`. Keyed by resolved directory so every line this
+# process records into a given directory lands in one file, exactly as the env-gated tap does.
+_EXPLICIT_PATHS: dict[str, Path] = {}
+
+
+def _explicit_path(directory: Path) -> Path | None:
+    key = str(directory)
+    existing = _EXPLICIT_PATHS.get(key)
+    if existing is not None:
+        return existing
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.now(tz=dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+        path = directory / f"envelopes-{stamp}-{os.getpid()}.jsonl"
+    except OSError:
+        return None
+    _EXPLICIT_PATHS[key] = path
+    return path
+
+
+def record_to(directory: Path, line: str, *, seat: str | None = None) -> None:
+    """Record `line` into `directory`, independent of `CLAUDE_RELAY_CAPTURE_DIR`.
+
+    For callers that already KNOW where the capture belongs — the Tier-2 harness, which reads a
+    child's stdout itself rather than going through `runner.py`.
+
+    This exists because routing that case through the env var was a live bug: the harness set
+    `CLAUDE_RELAY_CAPTURE_DIR` in the *child's* environment (correct-looking, since the child is the
+    thing being observed) while calling `record_line()` in the *parent*, whose own `os.environ` had
+    no such variable. Every call silently no-opped and the harness captured nothing across seven
+    successful `claude -p` runs. Worse, the burn's wall detector reads those files, so it could never
+    have stopped on a wall — it would have spent its entire cap for zero data.
+
+    The same shape as the original `^RESULT:` detector defect: a code path that looks correct, is
+    never exercised by a test that shares its assumptions, and does nothing at all. The unit test
+    that "covered" it patched `os.environ` in-process, thereby creating the condition production
+    lacked. An explicit destination removes the coupling instead of documenting it.
+    """
+    path = _explicit_path(directory)
+    if path is None:
+        return
+    _record(path, line, seat=seat)
+
+
 def record_line(line: str, *, seat: str | None = None) -> None:
     """Record `line` if it is one of the captured envelope types. No-op when the tap is off.
+
+    The env-gated tap, for `runner.py` — the operator switches it on for a whole supervisor run.
+    Callers that already know the destination should use `record_to()` instead.
 
     Never raises. On the first write failure the tap disables itself for the rest of the process
     rather than failing every subsequent line.
@@ -151,6 +199,11 @@ def record_line(line: str, *, seat: str | None = None) -> None:
     path = _resolve()
     if path is None:
         return
+    _record(path, line, seat=seat)
+
+
+def _record(path: Path, line: str, *, seat: str | None) -> None:
+    """Shared filter-and-append. Never raises."""
     if not any(token in line for token in _PREFILTER):
         return
     try:
@@ -190,8 +243,13 @@ def record_line(line: str, *, seat: str | None = None) -> None:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(blob + "\n")
     except OSError as exc:
-        _STATE.path = None
-        _STATE.disabled_reason = f"write failed, tap disabled for this process: {exc}"
+        # Only the env-gated tap self-disables here; an explicit `record_to()` destination belongs to
+        # a caller that will see its own empty artifact, and silently disabling ITS writes because
+        # one append failed would reintroduce exactly the silent-no-op class of bug this module was
+        # just fixed for.
+        if _STATE.path == path:
+            _STATE.path = None
+            _STATE.disabled_reason = f"write failed, tap disabled for this process: {exc}"
 
 
 def read_records(path: Path) -> list[dict[str, Any]]:

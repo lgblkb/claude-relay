@@ -303,3 +303,84 @@ class VocabularyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecordToExplicitDestinationTests(unittest.TestCase):
+    """`record_to()` must work with NO env var set anywhere.
+
+    This is the regression guard for a live silent-no-op bug: the Tier-2 harness set
+    CLAUDE_RELAY_CAPTURE_DIR in the CHILD's environment (the child being `claude`, which has never
+    heard of relay.capture) while calling `record_line()` in the PARENT, whose own os.environ lacked
+    it. Seven successful real runs recorded nothing, and the burn's wall detector reads those very
+    records — so it could never have stopped on a wall.
+
+    Every test here deliberately clears the env var. A test that patched it in would recreate the
+    condition production lacked, which is exactly how the original bug survived its own test.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        without_tap = {k: v for k, v in os.environ.items() if k != capture.CAPTURE_DIR_ENV}
+        self._env = mock.patch.dict(os.environ, without_tap, clear=True)
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        capture.reset_for_tests()
+        self.addCleanup(capture.reset_for_tests)
+
+    def test_records_with_the_env_gated_tap_completely_off(self) -> None:
+        self.assertFalse(capture.enabled())
+        target = self.tmp / "explicit"
+        capture.record_to(target, _event(), seat="ayan")
+        files = list(target.glob("envelopes-*.jsonl"))
+        self.assertEqual(len(files), 1)
+        records = capture.read_records(files[0])
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["seat"], "ayan")
+
+    def test_record_line_stays_a_noop_while_record_to_works(self) -> None:
+        """The two entry points are independent: the env-gated tap being off must not disable the
+        explicit one, and vice versa.
+        """
+        target = self.tmp / "explicit2"
+        capture.record_line(_event())  # off — writes nowhere
+        capture.record_to(target, _event())
+        self.assertEqual(len(capture.read_records(next(target.glob("envelopes-*.jsonl")))), 1)
+
+    def test_repeated_calls_append_to_one_file_per_directory(self) -> None:
+        target = self.tmp / "explicit3"
+        for util in (0.7, 0.8, 0.95):
+            capture.record_to(target, _event(util=util))
+        files = list(target.glob("envelopes-*.jsonl"))
+        self.assertEqual(len(files), 1, "each call created its own file instead of appending")
+        self.assertEqual(len(capture.read_records(files[0])), 3)
+
+    def test_separate_directories_get_separate_files(self) -> None:
+        a, b = self.tmp / "a", self.tmp / "b"
+        capture.record_to(a, _event())
+        capture.record_to(b, _event())
+        self.assertEqual(len(list(a.glob("envelopes-*.jsonl"))), 1)
+        self.assertEqual(len(list(b.glob("envelopes-*.jsonl"))), 1)
+
+    def test_applies_the_same_assistant_exclusion(self) -> None:
+        """Invariant #5 must hold on BOTH entry points, not just the env-gated one."""
+        target = self.tmp / "explicit4"
+        capture.record_to(target, json.dumps({"type": "assistant", "text": "SECRET=hunter2"}))
+        files = list(target.glob("envelopes-*.jsonl"))
+        if files:
+            self.assertNotIn("hunter2", files[0].read_text(encoding="utf-8"))
+        self.assertEqual(sum(len(capture.read_records(f)) for f in files), 0)
+
+    def test_unwritable_destination_is_a_noop_rather_than_a_raise(self) -> None:
+        blocker = self.tmp / "blocker"
+        blocker.write_text("", encoding="utf-8")
+        capture.record_to(blocker / "under-a-file", _event())  # must not raise
+
+    def test_an_explicit_write_failure_does_not_disable_the_env_gated_tap(self) -> None:
+        with mock.patch.dict(os.environ, {capture.CAPTURE_DIR_ENV: str(self.tmp / "gated")}):
+            capture.reset_for_tests()
+            self.assertTrue(capture.enabled())
+            with mock.patch.object(Path, "open", side_effect=OSError("nope")):
+                capture.record_to(self.tmp / "other", _event())
+            self.assertTrue(capture.enabled(), "an explicit-destination failure disabled the shared tap")

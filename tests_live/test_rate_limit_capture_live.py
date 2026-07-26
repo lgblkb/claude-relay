@@ -126,24 +126,35 @@ class RateLimitCaptureLiveTest(unittest.TestCase):
 
     def test_a_real_claude_run_produces_recordable_envelopes(self) -> None:
         """The end-to-end claim: a real child's NDJSON contains at least a terminal `result`
-        envelope, and the tap records it. This is what proves the Tier-1 tap is wired to reality
+        envelope, and the harness records it. This is what proves the capture is wired to reality
         rather than to a fixture — the failure mode that made the original `^RESULT:` detector dead
         code for its entire life.
+
+        NOTE the deliberate absence of a `mock.patch.dict(os.environ, ...)` here. An earlier version
+        of this test wrapped the call in exactly that, and it PASSED while the production path
+        recorded nothing across seven real runs — because patching the parent's environ created the
+        very condition production lacked. The test shared the bug's assumption and so could not see
+        it. `_run_claude_once()` must record with no env var set anywhere; that is the whole point.
         """
         capture_dir = self.tmp / "cap"
-        with mock.patch.dict(os.environ, {capture.CAPTURE_DIR_ENV: str(capture_dir)}):
-            capture.reset_for_tests()
-            outcome = ratelimit_probe._run_claude_once(
-                self.seat,
-                prompt="Reply with exactly the word: ok. Do not use any tools.",
-                model=None,
-                capture_dir=capture_dir,
-                timeout_s=120.0,
-            )
-            self.assertTrue(outcome.get("ok"), f"live claude run failed: {outcome}")
-            self.assertGreater(outcome.get("stdout_lines", 0), 0, "child emitted no stdout lines")
+        self.assertFalse(capture.enabled(), "env-gated tap must be OFF for this test to prove anything")
 
-            records = ratelimit_probe._collect_records(capture_dir)
+        outcome = ratelimit_probe._run_claude_once(
+            self.seat,
+            prompt="Reply with exactly the word: ok. Do not use any tools.",
+            model=None,
+            capture_dir=capture_dir,
+            timeout_s=120.0,
+        )
+        self.assertTrue(outcome.get("ok"), f"live claude run failed: {outcome}")
+        self.assertGreater(outcome.get("stdout_lines", 0), 0, "child emitted no stdout lines")
+        self.assertGreater(
+            outcome.get("records_after_call", 0),
+            0,
+            "the harness recorded ZERO envelopes from a successful real run — the recorder is a no-op",
+        )
+
+        records = ratelimit_probe._collect_records(capture_dir)
 
         results = [r for r in records if (r.get("envelope") or {}).get("type") == "result"]
         self.assertTrue(results, f"no terminal `result` envelope captured from a real run: {records}")

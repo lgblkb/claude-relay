@@ -318,7 +318,10 @@ def _run_claude_once(
 
     env = dict(os.environ)
     env["CLAUDE_CONFIG_DIR"] = str(seat.path)
-    env[capture.CAPTURE_DIR_ENV] = str(capture_dir)
+    # Deliberately NOT setting `capture.CAPTURE_DIR_ENV` here. Doing so was a live bug: it sets the
+    # variable for the CHILD, which is `claude` and has never heard of relay.capture, while the
+    # recording below happens in THIS process, whose own os.environ still lacks it. Every record
+    # silently no-opped. The parent records via `capture.record_to()` with an explicit destination.
 
     argv = [binary, "-p", prompt, "--output-format", "stream-json", "--verbose"]
     if model:
@@ -341,17 +344,21 @@ def _run_claude_once(
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": f"timeout after {timeout_s}s", "elapsed_s": time.time() - started}
 
-    # The tap only sees lines that pass through runner.py; a direct subprocess call here does not
-    # use runner.py at all, so feed this run's stdout through the same recorder explicitly.
+    # The env-gated tap only sees lines that pass through runner.py; this direct subprocess call does
+    # not use runner.py at all, so feed this run's stdout to the recorder with an EXPLICIT
+    # destination. `record_to()` rather than `record_line()` — see that function's docstring for the
+    # silent-no-op bug this replaced.
     lines = proc.stdout.splitlines()
     for line in lines:
-        capture.record_line(line, seat=seat.name)
+        capture.record_to(capture_dir, line, seat=seat.name)
 
+    recorded = len(_collect_records(capture_dir))
     return {
         "ok": proc.returncode == 0,
         "returncode": proc.returncode,
         "elapsed_s": time.time() - started,
         "stdout_lines": len(lines),
+        "records_after_call": recorded,
         "stderr_tail": proc.stderr[-2000:] if proc.stderr else "",
     }
 
@@ -556,10 +563,25 @@ def cmd_burn(args: argparse.Namespace) -> int:
         records = _collect_records(capture_dir)
         hit = _walled(records)
         state = "ok" if result.get("ok") else f"exit={result.get('returncode')} {result.get('error') or ''}"
-        line = f"  call {index + 1}/{max_calls}: {state}"
+        line = f"  call {index + 1}/{max_calls}: {state}  records={len(records)}"
         if current.five_hour_pct is not None:
             line += f"  five_hour~{current.five_hour_pct:.1f}%"
         print(line)
+
+        if index == 0 and result.get("ok") and not records:
+            # SILENCE IS NOT SUCCESS. Wall detection reads these records, so a burn that records
+            # nothing cannot possibly stop on a wall — it would spend its entire cap and report a
+            # tidy "max-calls-reached" having learned nothing. That is not hypothetical: the first
+            # real burn ran exactly this way because the recorder was a silent no-op (see
+            # `capture.record_to()`), and only an out-of-band check of the artifact directory caught
+            # it. Checking after the FIRST successful call bounds the waste at one call.
+            stop_reason = "recording-broken-nothing-captured"
+            print(
+                "\nABORTING: the first call succeeded but recorded ZERO envelopes.\n"
+                "  Wall detection reads those records, so this burn could never stop on a wall and\n"
+                "  every further call would be spent for no data. Fix the recorder, then re-run."
+            )
+            break
 
         if hit is not None:
             info = (hit.get("envelope") or {}).get("rate_limit_info") or {}
