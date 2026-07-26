@@ -386,6 +386,18 @@ def cmd_exchange_rate(args: argparse.Namespace) -> int:
         return 1
 
     before = reread(seat)
+    if before.error is not None or before.five_hour_pct is None:
+        # FAIL CLOSED before spending. The entire output of this subcommand is a DELTA between two
+        # readings, so without a baseline there is nothing to compute and every call made would be
+        # quota spent for no measurement. Observed for real on the first live run (2026-07-27): a
+        # lingering 429 made both readings None, three calls were spent anyway, and the summary
+        # then reported "five_hour did not move measurably" — a misleading conclusion drawn from an
+        # absent measurement, which is strictly worse than refusing to run.
+        detail = before.error or "endpoint sent no five_hour.utilization"
+        print(f"refusing to measure: could not read seat {seat.name!r} usage ({detail})")
+        print("this subcommand reports a DELTA between two readings; without a baseline it can only mislead")
+        return 1
+
     print(f"seat {seat.name!r} before: five_hour={before.five_hour_pct}%  seven_day={before.seven_day_pct}%")
     print(f"spending {args.calls} small call(s) to measure the exchange rate...")
 
@@ -401,6 +413,29 @@ def cmd_exchange_rate(args: argparse.Namespace) -> int:
     # The endpoint lags a little behind a just-finished call; give it a moment before re-reading.
     time.sleep(args.settle)
     after = reread(seat)
+    if after.error is not None or after.five_hour_pct is None:
+        # The spend already happened, so unlike the baseline guard this cannot be undone — but it
+        # must not be reported as a measurement. Say plainly that the quota is spent and the
+        # exchange rate is unknown, rather than subtracting None and calling the result 0.00.
+        detail = after.error or "endpoint sent no five_hour.utilization"
+        print(f"seat {seat.name!r} after:  UNREADABLE ({detail})")
+        print(f"\n{len(calls)} call(s) were spent but the result CANNOT be measured — no exchange rate.")
+        print("re-run once the endpoint is readable again; the spend is not recoverable.")
+        _write_artifact(
+            out_dir,
+            "tier0.5-exchange-rate-UNMEASURED",
+            {
+                "tier": 0.5,
+                "seat": seat.name,
+                "calls_attempted": args.calls,
+                "calls": calls,
+                "before": {"five_hour_pct": before.five_hour_pct, "seven_day_pct": before.seven_day_pct},
+                "after_error": detail,
+                "outcome": "spent-but-unmeasured",
+            },
+        )
+        return 1
+
     print(f"seat {seat.name!r} after:  five_hour={after.five_hour_pct}%  seven_day={after.seven_day_pct}%")
 
     d_five = (after.five_hour_pct or 0.0) - (before.five_hour_pct or 0.0)
@@ -431,6 +466,27 @@ def cmd_exchange_rate(args: argparse.Namespace) -> int:
             f"PROJECTED COST of a full Tier-2 burn on {seat.name!r}: "
             f"{projected:.1f} pts of weekly quota over ~{per_pt_calls * remaining:.0f} more call(s)"
         )
+        if d_seven <= 0.0:
+            # The endpoint reports both gauges as INTEGER percents, so any weekly movement under
+            # one full point rounds to zero. A literal reading of `ratio == 0.0` therefore says a
+            # burn is FREE in weekly terms, which is false and is exactly the kind of number
+            # someone would approve a spend against. Observed on the first real measurement
+            # (2026-07-27): 4 calls moved five_hour +2 and seven_day +0, while a wider sample over
+            # the same session moved five_hour 57->70 alongside seven_day 52->54 — i.e. a true
+            # ratio near 0.15, not 0. Say so instead of implying zero cost.
+            floor_ratio = 1.0 / d_five  # one full weekly point was NOT yet observed, so this bounds it
+            verdict["below_gauge_resolution"] = True
+            verdict["seven_day_pts_per_five_hour_pt_upper_bound"] = floor_ratio
+            verdict["projected_seven_day_cost_pts_upper_bound"] = floor_ratio * remaining
+            print(
+                "  NOTE: weekly moved less than the endpoint's 1-point resolution, so that 0.0 is "
+                "'below measurable', NOT 'free'."
+            )
+            print(
+                f"  Upper bound from this sample: <{floor_ratio:.3f} weekly pts per five_hour pt, "
+                f"so <{floor_ratio * remaining:.1f} weekly pts to the wall."
+            )
+            print("  Widen --calls for a tighter estimate, or read the burn's own before/after delta.")
     else:
         verdict["note"] = (
             "five_hour did not move measurably — either the spend was too small to register at the "

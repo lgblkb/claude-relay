@@ -305,3 +305,80 @@ class FailClosedTests(unittest.TestCase):
         likely to run alongside a live supervisor is how both end up 429'd.
         """
         self.assertGreaterEqual(ratelimit_probe._USAGE_REREAD_INTERVAL_S, 90.0)
+
+    def test_exchange_rate_refuses_to_spend_without_a_baseline_reading(self) -> None:
+        """The whole output is a delta between two readings. Without a baseline, every call spent is
+        quota burned for no measurement — and the pre-fix code went on to report "did not move
+        measurably", a conclusion drawn from an absent measurement. Observed live 2026-07-27.
+        """
+        args = ratelimit_probe.build_parser().parse_args(["exchange-rate", "--seat", "ayan"])
+        unreadable = _reading("ayan", None, None, error="usage endpoint rate-limited us")
+        with (
+            mock.patch.object(ratelimit_probe, "_resolve_seat", return_value=_reading("ayan", 50.0, 50.0)),
+            mock.patch.object(ratelimit_probe, "reread", return_value=unreadable),
+            mock.patch.object(ratelimit_probe, "_run_claude_once") as spawn,
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            rc = ratelimit_probe.cmd_exchange_rate(args)
+        self.assertEqual(rc, 1)
+        spawn.assert_not_called()
+        self.assertIn("refusing to measure", out.getvalue())
+
+    def test_exchange_rate_reports_spent_but_unmeasured_when_the_after_read_fails(self) -> None:
+        """Once the calls are made the spend is unrecoverable, so the only honest outcome is to say
+        so — never to subtract a missing reading and call the delta 0.00.
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = ratelimit_probe.build_parser().parse_args(
+                ["--out", tmp, "exchange-rate", "--seat", "ayan", "--calls", "1", "--settle", "0"]
+            )
+            good = _reading("ayan", 50.0, 50.0)
+            bad = _reading("ayan", None, None, error="rate-limited")
+            with (
+                mock.patch.object(ratelimit_probe, "_resolve_seat", return_value=good),
+                mock.patch.object(ratelimit_probe, "reread", side_effect=[good, bad]),
+                mock.patch.object(
+                    ratelimit_probe, "_run_claude_once", return_value={"ok": True, "elapsed_s": 1.0}
+                ),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
+                rc = ratelimit_probe.cmd_exchange_rate(args)
+            printed = out.getvalue()
+            self.assertEqual(rc, 1)
+            self.assertIn("CANNOT be measured", printed)
+            self.assertNotIn("+0.00", printed)
+            self.assertTrue(list(Path(tmp).glob("tier0.5-exchange-rate-UNMEASURED-*.json")))
+
+    def test_a_zero_weekly_delta_is_reported_as_below_resolution_not_as_free(self) -> None:
+        """The endpoint reports both gauges as INTEGER percents, so weekly movement under one point
+        rounds to zero. Reporting that as a 0.000 exchange rate implies a burn costs no weekly quota,
+        which is false — and it is the number someone would approve a spend against. Observed on the
+        first real measurement, 2026-07-27.
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = ratelimit_probe.build_parser().parse_args(
+                ["--out", tmp, "exchange-rate", "--seat", "ayan", "--calls", "4", "--settle", "0"]
+            )
+            before = _reading("ayan", 70.0, 54.0)
+            after = _reading("ayan", 72.0, 54.0)  # five_hour moved, weekly did not
+            with (
+                mock.patch.object(ratelimit_probe, "_resolve_seat", return_value=before),
+                mock.patch.object(ratelimit_probe, "reread", side_effect=[before, after]),
+                mock.patch.object(
+                    ratelimit_probe, "_run_claude_once", return_value={"ok": True, "elapsed_s": 1.0}
+                ),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
+                rc = ratelimit_probe.cmd_exchange_rate(args)
+            printed = out.getvalue()
+            self.assertEqual(rc, 0)
+            self.assertIn("below measurable", printed)
+            self.assertNotIn("free", printed.replace("NOT 'free'", ""))
+            self.assertIn("Upper bound", printed)
+            artifact = json.loads(next(Path(tmp).glob("tier0.5-exchange-rate-*.json")).read_text())
+            self.assertTrue(artifact["below_gauge_resolution"])
+            self.assertGreater(artifact["seven_day_pts_per_five_hour_pt_upper_bound"], 0.0)
