@@ -255,6 +255,16 @@ def near_cap(usage: UsageSnapshot, threshold: float = NEAR_CAP_PCT) -> bool:
     signal). Distinct from `rotate_off`, which fires much earlier (default 90%, OR any
     non-"normal" severity) so the loop hands a seat off well before hard exhaustion.
 
+    Observed `severity` values, all live: `normal`, `warning` (at 82%, 2026-07-19), and `critical`
+    (at 100% on a seat that had genuinely walled, 2026-07-27). `rotate_off()` gates on
+    `severity != "normal"`, so `critical` routes correctly with no enum change needed — verified
+    against a real walled seat, whose endpoint payload was:
+        five_hour {"utilization": 100.0, "resets_at": "...T22:30:00Z"}
+        limits[]  {"kind":"session","percent":100,"severity":"critical","is_active":true}
+    and on which `session_utilization()`, `session_percent()`, `near_cap()` and
+    `rotate_off(high=90)` all reported the wall correctly. That is the Invariant #2 primary path
+    working as designed, and it is why the NDJSON `rate_limit_event` is only a supplementary signal.
+
     Percent-only, deliberately NOT severity-gated: a real live probe against this endpoint
     (2026-07-19) observed `severity: "warning"` at only 82% utilization — i.e. Anthropic's
     severity tiers are an early/soft signal (exactly what `rotate_off` should react to), not

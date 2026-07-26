@@ -253,10 +253,59 @@ Two schema notes from the same envelope:
   once a warning threshold is crossed, so `_RATE_LIMIT_UTILIZATION_ROTATE_THRESHOLD` cannot fire
   on a plain `allowed` event regardless of its value.
 
-**Q1, Q2, Q4 remain open** — reaching them needs a genuinely walled window, which the corrected
-harness is built to capture. The standing prediction above is **untested**: it concerns a
-`seven_day` event at high utilization, and the only high-utilization event ever seen is the
-original `seven_day`/0.76 one, below the 0.9 threshold.
+#### Q1 answered — the event channel cannot report a denial
+
+A second Tier-2 burn drove one five-hour window from **84% → 100%**, capturing **42 events across
+42 calls** for **$1.49** and **+2 points** of weekly quota. Every call **succeeded**: `is_error`
+false, `subtype: success`, `api_error_status: null`, `stop_reason: end_turn`, throughout.
+
+| status | rateLimitType | utilization | count |
+| --- | --- | --- | --- |
+| `allowed` | `five_hour` | *absent* | 13 |
+| `allowed_warning` | `five_hour` | 0.90 → 0.99 | 29 |
+
+The event stream warned continuously and **never emitted a blocking status**; `utilization` peaked
+at 0.99 and never reached 1.0. The wall then materialized in a *different* session minutes later.
+
+So Q1's premise was wrong. There is no "walled run" whose envelopes can be inspected, because **the
+run that gets refused never starts**. `rate_limit_event` is a *warning* channel, full stop.
+
+The authoritative wall signal is the **usage endpoint**, verified against the genuinely walled seat:
+
+```json
+five_hour {"utilization": 100.0, "resets_at": "2026-07-26T22:30:00Z"}
+limits[]  {"kind":"session","percent":100,"severity":"critical","is_active":true}
+```
+
+`severity: "critical"` is a third observed value (after `normal` and `warning` at 82%).
+`rotate_off()` gates on `severity != "normal"`, so it routes correctly with no enum change —
+`session_utilization()`, `session_percent()`, `near_cap()` and `rotate_off(high=90)` all reported
+the wall correctly. **Invariant #2's primary path works as designed.**
+
+This is also the strongest justification for the `_KNOWN_SAFE_RATE_LIMIT_STATUSES` fix above: if the
+event channel *cannot* report a denial, then treating an unfamiliar status **as** a denial can only
+ever produce false positives — which is precisely the force-cooling bug.
+
+#### Q4 answered — the threshold constant does less than it appears
+
+`0.9` is a **real platform threshold**: every event carrying `utilization` also carried
+`surpassedThreshold: 0.9`, so the hand-picked value happened to match. But `utilization` is
+**absent below 0.9 entirely**, so `>= 0.9` fires on the first event that carries the field at all —
+the constant is operationally a *presence check*, and lowering it would change nothing. Also,
+`surpassedThreshold` can be **absent even when `utilization` is present** (2 events at exactly
+0.90), so it must never be used as a presence proxy.
+
+#### Two mispredictions, left on the record
+
+The standing prediction above is **still untested**, and I was wrong twice about why. First I wrote
+that "Q3 and Q4 settle it" — they do not; Q3 says nothing about the cooldown horizon. Then I wrote
+that Q4 might be unreachable because five-hour events omit `utilization` — also wrong; they carry it
+above 0.9, and I had generalized from the single pre-burn `allowed` event.
+
+Testing it needs a `seven_day` event at ≥ 0.9, i.e. a nearly-exhausted **weekly** window, which the
+Tier-1 passive tap will eventually observe and a five-hour burn never can. Both errors share one
+shape — inferring a general rule from a single observation — which is the exact failure the harness
+exists to prevent.
 
 ## 5. gad-kit brain: triage, outcome & the recovery-routing fix (`gadkit.py`)
 

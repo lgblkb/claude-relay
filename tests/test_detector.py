@@ -609,3 +609,72 @@ class RateLimitEventSafeStatusTests(unittest.TestCase):
         assert signal is not None
         self.assertIsNone(signal.utilization)
         self.assertEqual(signal.rate_limit_type, "five_hour")
+
+
+class RateLimitUtilizationCalibrationTests(unittest.TestCase):
+    """Pins what the 2026-07-27 Tier-2 burn measured about `utilization`.
+
+    42 events captured while driving one five-hour window from 84% to 100%, across 42 SUCCESSFUL
+    calls. The shape of that data constrains the threshold constant in ways the original guess did
+    not anticipate.
+    """
+
+    @staticmethod
+    def _event(**info: object) -> list[str]:
+        base: dict[str, object] = {"rateLimitType": "five_hour", "resetsAt": 1785105000}
+        base.update(info)
+        return [json.dumps({"type": "rate_limit_event", "rate_limit_info": base})]
+
+    def test_utilization_is_absent_below_the_warning_threshold(self) -> None:
+        """13 `allowed` events carried NO `utilization`. So the rotate check must tolerate its
+        absence rather than defaulting it to anything.
+        """
+        signal = detector.latest_rate_limit_signal(self._event(status="allowed"))
+        assert signal is not None
+        self.assertIsNone(signal.utilization)
+        self.assertIsNone(detector._rate_limit_event_action(self._event(status="allowed")))
+
+    def test_the_first_event_carrying_utilization_already_meets_the_threshold(self) -> None:
+        """The operational consequence of the above: the lowest `utilization` ever observed is
+        exactly 0.90, so `>= 0.9` fires on the FIRST event that carries the field. The constant is
+        equivalent to a presence check — worth pinning, because someone lowering it to "be safer"
+        would be changing nothing at all.
+        """
+        self.assertLessEqual(detector._RATE_LIMIT_UTILIZATION_ROTATE_THRESHOLD, 0.9)
+        action = detector._rate_limit_event_action(self._event(status="allowed_warning", utilization=0.9))
+        self.assertIsNotNone(action)
+
+    def test_surpassed_threshold_may_be_absent_even_when_utilization_is_present(self) -> None:
+        """2 of 29 events at exactly 0.90 carried no `surpassedThreshold`, so it must never be used
+        as a proxy for "is this a warning event".
+        """
+        tail = self._event(status="allowed_warning", utilization=0.9)
+        self.assertNotIn("surpassedThreshold", tail[0])
+        self.assertIsNotNone(detector._rate_limit_event_action(tail))
+
+    def test_utilization_below_the_threshold_does_not_rotate(self) -> None:
+        """The original 2026-07-26 observation: seven_day at 0.76. Must stay non-rotating."""
+        tail = [
+            json.dumps(
+                {
+                    "type": "rate_limit_event",
+                    "rate_limit_info": {
+                        "status": "allowed_warning",
+                        "rateLimitType": "seven_day",
+                        "utilization": 0.76,
+                        "surpassedThreshold": 0.75,
+                        "resetsAt": 1785290400,
+                    },
+                }
+            )
+        ]
+        self.assertIsNone(detector._rate_limit_event_action(tail))
+
+    def test_ninety_nine_percent_still_only_rotates_never_treated_as_a_denial(self) -> None:
+        """utilization peaked at 0.99 with every call SUCCEEDING. High utilization is a rotate
+        signal, not evidence the request was refused.
+        """
+        action = detector._rate_limit_event_action(self._event(status="allowed_warning", utilization=0.99))
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action.kind, detector.CONTINUE_ROTATE)

@@ -297,3 +297,75 @@ class BoolUtilizationRejectionTests(unittest.TestCase):
     def test_a_genuine_numeric_reading_still_works(self) -> None:
         self.assertEqual(usage.session_utilization(self._snapshot(57)), 57.0)
         self.assertEqual(usage.session_utilization(self._snapshot(57.5)), 57.5)
+
+
+class WalledSeatEndpointTests(unittest.TestCase):
+    """The endpoint payload of a seat that had ACTUALLY walled, captured 2026-07-27.
+
+    `ayan` hit its five-hour session limit for real; this is the first observation of a walled
+    seat's payload. It matters more than the NDJSON event, because Invariant #2 makes the endpoint a
+    PRIMARY decider while the event is supplementary.
+
+    `severity: "critical"` was a new value here (previously only `normal` and `warning` at 82%).
+    `rotate_off()` gates on `severity != "normal"`, so it routes correctly with no enum change —
+    this pins that, so a future refactor to an explicit severity allowlist cannot silently drop it.
+    """
+
+    WALLED = {
+        "five_hour": {"utilization": 100.0, "resets_at": "2026-07-26T22:30:00.743308+00:00"},
+        "seven_day": {"utilization": 57.0, "resets_at": "2026-07-28T16:00:00.743341+00:00"},
+        "limits": [
+            {
+                "kind": "session",
+                "group": "session",
+                "percent": 100,
+                "severity": "critical",
+                "resets_at": "2026-07-26T22:30:00.743308+00:00",
+                "is_active": True,
+            },
+            {
+                "kind": "weekly_all",
+                "group": "weekly",
+                "percent": 57,
+                "severity": "normal",
+                "resets_at": "2026-07-28T16:00:00.743341+00:00",
+                "is_active": False,
+            },
+        ],
+    }
+
+    def _snapshot(self) -> usage.UsageSnapshot:
+        return usage.UsageSnapshot.from_json(self.WALLED, fetched_at=0.0)
+
+    def test_a_walled_seat_is_rotated_off(self) -> None:
+        self.assertTrue(usage.rotate_off(self._snapshot(), high_pct=90.0))
+
+    def test_a_walled_seat_reads_as_near_cap(self) -> None:
+        self.assertTrue(usage.near_cap(self._snapshot()))
+
+    def test_session_utilization_reports_the_full_hundred(self) -> None:
+        self.assertEqual(usage.session_utilization(self._snapshot()), 100.0)
+        self.assertEqual(usage.session_percent(self._snapshot()), 100.0)
+
+    def test_critical_severity_is_parsed_and_preserved(self) -> None:
+        session = usage.active_session_limit(self._snapshot())
+        self.assertIsNotNone(session)
+        assert session is not None
+        self.assertEqual(session.severity, "critical")
+
+    def test_critical_severity_alone_rotates_even_below_the_percent_gate(self) -> None:
+        """The severity tier must be able to rotate a seat on its own. If a future change made
+        rotation percent-only, a `critical` seat below `high_pct` would keep receiving work.
+        """
+        payload = json.loads(json.dumps(self.WALLED))
+        payload["five_hour"]["utilization"] = 50.0
+        payload["limits"][0]["percent"] = 50
+        snapshot = usage.UsageSnapshot.from_json(payload, fetched_at=0.0)
+        self.assertTrue(usage.rotate_off(snapshot, high_pct=90.0))
+
+    def test_the_session_reset_time_is_recoverable_for_the_cooldown(self) -> None:
+        """The supervisor cools a walled seat until this instant, so it must parse."""
+        resets = usage.session_resets_at(self._snapshot())
+        self.assertIsNotNone(resets)
+        assert resets is not None
+        self.assertEqual(resets.hour, 22)

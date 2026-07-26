@@ -230,12 +230,29 @@ def _is_safe_rate_limit_status(status: str) -> bool:
     """
     return status in _KNOWN_SAFE_RATE_LIMIT_STATUSES or status.startswith(_SAFE_RATE_LIMIT_STATUS_PREFIX)
 
-# `utilization` is a 0..1 FRACTION (observed 0.76), NOT a percent. Even a KNOWN-safe status
-# ("allowed_warning" literally means "the request was allowed") is still usable as a signal on
-# its own once utilization is high enough — hand-picked, not derived from any confirmed second
-# threshold (the one field actually seen, `surpassedThreshold: 0.75`, is the threshold that
-# triggered THIS warning, not necessarily the point past which requests get denied). Guessing
-# toward "rotate and cool down" rather than "keep spending", per the audit's explicit direction.
+# `utilization` is a 0..1 FRACTION (observed 0.76-0.99), NOT a percent. Even a KNOWN-safe status
+# ("allowed_warning" literally means "the request was allowed") is still usable as a signal on its
+# own once utilization is high enough.
+#
+# CALIBRATED 2026-07-27 by a Tier-2 burn (see relay/ratelimit_probe.py) that drove one seat's
+# five-hour window from 84% to 100%, capturing 42 events across 42 successful calls:
+#
+#   * 0.9 is a REAL platform threshold, not just our guess. Every event carrying `utilization` also
+#     carried `surpassedThreshold: 0.9`. The hand-picked value happened to match the platform's own.
+#   * BUT `utilization` is ABSENT below 0.9 — 13 `allowed` events had no `utilization` field at all,
+#     then 29 `allowed_warning` events carried 0.90 → 0.99. So `utilization >= 0.9` fires on the
+#     very FIRST event that carries the field, which makes this threshold operationally equivalent
+#     to `utilization is not None`. The number does no work beyond a presence check; lowering it
+#     would change nothing, and raising it is the only edit with any effect.
+#   * `surpassedThreshold` can be absent even when `utilization` is present (2 events at exactly
+#     0.90 had no `surpassedThreshold`), so it must never be relied on as a presence proxy.
+#   * utilization peaked at 0.99 and NEVER reached 1.0, and all 42 calls succeeded. Being past this
+#     threshold does not mean requests are being denied — see `_KNOWN_SAFE_RATE_LIMIT_STATUSES`
+#     above for why erring toward "rotate" is not the safe direction it appears to be.
+#
+# Kept at 0.9 anyway: it matches the platform's own warning threshold, and claude-relay's synthetic
+# `ceiling_pct` (default 70) rotates far earlier via the usage endpoint regardless, so this is a
+# backstop rather than the primary gate.
 _RATE_LIMIT_UTILIZATION_ROTATE_THRESHOLD = 0.9
 
 

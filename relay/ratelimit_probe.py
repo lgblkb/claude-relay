@@ -38,24 +38,45 @@ PRE-REGISTERED QUESTIONS (fixed before looking at any result; answers appended, 
   Q1  Does a five-hour wall emit a `rate_limit_event` AT ALL, or only a terminal `result` error?
       If the latter, `detector._rate_limit_event_action()` is decorative exactly when it matters
       and the stdout backstop is the real path. Highest-value question here.
-      -> OPEN. Needs a genuinely walled window.
+      -> ANSWERED (2026-07-27), and NOT in either direction the question anticipated. The burn drove
+         the window 84% -> 100% and every one of 42 calls SUCCEEDED: `is_error` false, subtype
+         `success`, `api_error_status` null, `stop_reason` `end_turn`, throughout. The event stream
+         warned continuously (utilization 0.90 -> 0.99) but never once emitted a blocking status,
+         and utilization never reached 1.0. The wall then materialized in a DIFFERENT session
+         minutes later.
+         So the premise was wrong: there is no "walled run" whose envelopes we can inspect, because
+         the run that gets refused is a run that never starts. The event stream is a WARNING channel
+         only. The authoritative wall signal is the usage endpoint — `severity: "critical"` at
+         `percent: 100` on the `limits[]` session entry — which is exactly what Invariant #2 already
+         designates as primary. Verified directly against the walled seat: `session_utilization()`,
+         `session_percent()`, `near_cap()` and `rotate_off(high=90)` all reported it correctly.
+         This is the strongest available justification for the `_KNOWN_SAFE_RATE_LIMIT_STATUSES`
+         fix: if the event channel cannot report a denial, then treating an unfamiliar status AS a
+         denial can only ever produce false positives.
   Q2  Which `status` values exist? `allowed_warning` is the only one ever observed.
-      -> PARTIAL (2026-07-27): `allowed` also exists. Its absence from
-         `detector._KNOWN_SAFE_RATE_LIMIT_STATUSES` was a live HIGH-severity bug — see that
-         constant's comment. No BLOCKING value observed yet, so the enum's far end is still open.
+      -> ANSWERED as far as this channel goes: {`allowed`, `allowed_warning`} and nothing else,
+         across 42 events spanning 84% -> 100% of a window. Per Q1 a blocking value may not exist in
+         this channel at all. `allowed`'s absence from the known-safe set was a live HIGH-severity
+         bug — see that constant's comment.
   Q3  Does `rateLimitType: "five_hour"` ever appear? Only `seven_day` has been seen — yet the
       five-hour window is what the rotation logic actually keys on.
-      -> YES (2026-07-27). The in-run signal does cover the window rotation keys on.
+      -> YES (2026-07-27), on all 42 events. The in-run signal does cover the window rotation keys
+         on.
   Q4  Is there an event at ~0.9 utilization, and does `status` change there or does only
       `surpassedThreshold` move? `_RATE_LIMIT_UTILIZATION_ROTATE_THRESHOLD = 0.9` is hand-picked.
-      -> OPEN, and harder than assumed: the observed `allowed`/`five_hour` event carried NO
-         `utilization` and NO `surpassedThreshold` at all. Those fields appear only once a warning
-         threshold is crossed, so the 0.9 threshold cannot fire on ordinary events regardless of
-         its value.
+      -> ANSWERED. 0.9 is a REAL platform threshold: every event carrying `utilization` also carried
+         `surpassedThreshold: 0.9`. The hand-picked value happened to match. But `utilization` is
+         ABSENT below 0.9 entirely, so `>= 0.9` fires on the first event that carries the field —
+         the constant is operationally a presence check and lowering it would change nothing.
+         `status` does change at the boundary (`allowed` -> `allowed_warning`); `surpassedThreshold`
+         can be absent even when `utilization` is present (2 events at exactly 0.90).
   Q5  Do the event's fractional `utilization` and the endpoint's percent `five_hour.utilization`
       agree at the same moment? Free cross-check that 0.9 is in the right units on the right gauge.
-      -> BLOCKED BY Q4: no event carrying `utilization` has been captured alongside an endpoint
-         read, because the only events seen on the five-hour window omit the field.
+      -> CONSISTENT (2026-07-27): the burn's own progress log paired endpoint reads of 84/86/91/94/98
+         percent against event utilizations of 0.90-0.99 over the same interval, and both saturated
+         together at the end (endpoint 100.0, events 0.99). Same gauge, same window, differing only
+         by the fraction-vs-percent scale already documented. Not a synchronized single-instant
+         sample, so it is corroboration rather than proof.
   Q6  Is `modelUsage` present in the terminal `result`? Unblocks the deferred Phase 2 cost work.
       -> YES (2026-07-27), with per-model inputTokens / outputTokens / cacheReadInputTokens /
          costUSD / contextWindow, plus top-level `total_cost_usd`, `api_error_status`,
@@ -69,12 +90,17 @@ cools that seat until the WEEKLY reset — potentially days — discarding the r
 AND a possibly-fresh five-hour window. I predict this is wrong and that both the threshold and the
 cooldown horizon must become window-aware.
 
-  -> STILL UNTESTED as of 2026-07-27. I originally wrote "Q3 and Q4 settle it"; that was wrong.
-     Q3 came back YES but says nothing about the cooldown horizon, and Q4 is not merely open but
-     may be unreachable by this route, since five-hour events omit `utilization` entirely. The
-     prediction needs a `seven_day` event at high utilization — which arrives on the Tier-1 passive
-     tap, not from a five-hour burn. Recording the misprediction rather than quietly restating the
-     claim: the experiment I designed could not have tested the thing I said it would test.
+  -> STILL UNTESTED as of 2026-07-27, and I mispredicted twice about it.
+     First I wrote "Q3 and Q4 settle it". They do not: Q3 came back YES but says nothing about the
+     cooldown horizon. Then I wrote that Q4 might be unreachable because five-hour events omit
+     `utilization` — also wrong, they carry it above 0.9; I had generalized from the single `allowed`
+     event captured before the burn reached the warning band.
+     The prediction still stands unexamined because it concerns a `seven_day` event at >= 0.9, and
+     every high-utilization event captured has been `five_hour`. Reaching it needs a nearly-exhausted
+     WEEKLY window, which the Tier-1 passive tap will eventually see and a five-hour burn never can.
+     Both mispredictions are left in place rather than tidied away: the pattern in them is that I
+     twice inferred a general rule from one observation, which is the same error the harness exists
+     to prevent.
 """
 
 from __future__ import annotations
