@@ -1191,6 +1191,96 @@ class AllExhaustedNoticeReArmTests(unittest.TestCase):
 
             self.assertTrue(cooldown.was_notified(state, "needs-login:/home/u/.claude-x"))
 
+    def test_run_loop_actually_reaches_the_clear_on_a_bounded_single_unit_run(self) -> None:
+        """The call site must be REACHABLE — this is the test whose absence shipped a dead fix.
+
+        MEASURED (live-run-02): the clear was first placed beside the action handling, which sits
+        BELOW the `max_units` gate. With `max_units = 1` the loop returns from that gate immediately
+        after the unit is counted, so the clear never executed at all. A full generation ran, the
+        supervisor exited cleanly, and `all-exhausted` was still in `state.json`.
+
+        Every unit test for the fix passed throughout, because they all called
+        `_clear_exhausted_notice()` directly. Testing a helper in isolation says nothing about
+        whether production control flow ever gets there — so this drives the real `loop.run()`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            state_path = state_dir / "state.json"
+
+            # Pre-seed the exact condition the live run was in: the key set from an earlier
+            # exhaustion, persisted on disk, because `run()` loads state from disk itself.
+            seeded = _state()
+            cooldown.mark_notified(seeded, loop._ALL_EXHAUSTED_KEY)
+            cooldown.save_state(state_path, seeded)
+
+            cfg = Config(
+                state_dir=state_dir,
+                state_path=state_path,
+                max_units=1,
+                notify_sink="stdout",
+            )
+            repo = Path(tmp) / "repo"
+
+            iteration = loop.IterationResult(
+                plan=gadkit.Plan(kind="RUN", repo=repo, gen=1, mode="gad_run"),
+                action=detector.Action(kind=detector.CONTINUE),
+                seat=fleet.Seat(
+                    name="azim",
+                    path=Path("/home/u/.claude-azim"),
+                    has_creds=True,
+                    needs_login=False,
+                ),
+                run_result=mock.Mock(),  # non-None => counts as a completed unit
+                outcome=None,
+            )
+
+            with (
+                mock.patch.object(loop, "run_once", return_value=iteration),
+                mock.patch.object(loop.notify, "dispatch", return_value=True),
+            ):
+                rc = loop.run(repo, cfg)
+
+            self.assertEqual(rc, 0)
+            reloaded = cooldown.load_state(state_path)
+            self.assertFalse(
+                cooldown.was_notified(reloaded, loop._ALL_EXHAUSTED_KEY),
+                "run() completed a unit but left all-exhausted set: the clear is unreachable again",
+            )
+
+    def test_run_loop_leaves_the_key_alone_when_no_seat_was_available(self) -> None:
+        """The mirror case: no seat means the condition did NOT resolve, so the key must persist —
+        otherwise the clear would re-arm the alert on the very iteration that should be suppressing
+        it, and the operator would be paged on every wait.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            state_path = state_dir / "state.json"
+            seeded = _state()
+            cooldown.mark_notified(seeded, loop._ALL_EXHAUSTED_KEY)
+            cooldown.save_state(state_path, seeded)
+
+            cfg = Config(state_dir=state_dir, state_path=state_path, max_units=1, notify_sink="stdout")
+            repo = Path(tmp) / "repo"
+
+            iteration = loop.IterationResult(
+                plan=gadkit.Plan(kind="RUN", repo=repo, gen=1, mode="gad_run"),
+                action=None,
+                seat=None,
+                run_result=None,
+                seat_notes=["in-cooldown: ayan", "in-cooldown: azim"],
+            )
+
+            with (
+                mock.patch.object(loop, "run_once", return_value=iteration),
+                mock.patch.object(loop.notify, "dispatch", return_value=True),
+            ):
+                # once=True so the no-seat branch returns instead of sleeping for real.
+                rc = loop.run(repo, cfg, once=True)
+
+            self.assertEqual(rc, 0)
+            reloaded = cooldown.load_state(state_path)
+            self.assertTrue(cooldown.was_notified(reloaded, loop._ALL_EXHAUSTED_KEY))
+
     def test_notification_fires_again_after_a_clear(self) -> None:
         """The whole point, end to end: notify -> deduped -> clear -> notifies AGAIN."""
         from relay import notify as notify_mod

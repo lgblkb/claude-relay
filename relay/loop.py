@@ -827,6 +827,22 @@ def run(
                 if iteration.plan.kind not in ("AWAITING_HUMAN", "BLOCKED"):
                     cooldown.clear_notified_prefix(state, f"park:{repo}:")
 
+                # A seat WAS available this iteration, so the all-exhausted condition has resolved:
+                # re-arm that notification for the next exhaustion event.
+                #
+                # Placed HERE — beside the park-prefix clear, immediately after `run_once()` — and
+                # NOT further down beside the action handling, which is where it first went. MEASURED
+                # (live-run-02): everything below the `max_units` gate is skipped on the final unit
+                # of a bounded run, so with `max_units = 1` a clear placed down there never executed
+                # at all. The generation completed, the supervisor exited cleanly, and the key was
+                # still set. Its unit tests passed the whole time because they called the helper
+                # directly and never established that the call site was reachable.
+                #
+                # Gated on `seat`, not on `action`: "a seat was available" is literally the condition
+                # whose resolution re-arms the alert.
+                if iteration.seat is not None:
+                    _clear_exhausted_notice(config, state)
+
                 # Recovery stash notification (low priority, finding #5b): every stash gets a
                 # unique key (the message embeds a timestamp), so this never dedupes-forever.
                 if iteration.plan.kind == "RUN" and iteration.plan.stashed_ref is not None:
@@ -880,16 +896,6 @@ def run(
                         return 0
                     _sleep_and_poll(wait_s, config, state, repo, lock)
                     continue
-
-                # A seat WAS selected, so the all-exhausted condition has resolved: re-arm the
-                # notification for the next exhaustion event. `notify()` dedupes on mere key
-                # PRESENCE (`was_notified()` is a bare `in` test with no TTL), and nothing cleared
-                # this key, so before this line the highest-severity alert the supervisor can send
-                # — "I have stopped working and cannot proceed" — fired exactly ONCE per
-                # `state.json` lifetime and was silent for every later exhaustion, forever.
-                # `clear_notified_prefix()`'s own docstring describes this bug class verbatim for
-                # `park:` keys; `all-exhausted` was left with it.
-                _clear_exhausted_notice(config, state)
 
                 kind = iteration.action.kind
                 if kind == detector.CONTINUE or _is_genuine_wall_hit_rotation(kind, iteration.outcome):
