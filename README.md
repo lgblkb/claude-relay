@@ -230,6 +230,26 @@ is also the best thing to run over SSH from a phone. Idle seats can't be polled 
 standalone OAuth token refresh (still deferred), so between runs an idle seat shows its last-known
 `state.json` reading (or `auth?` if its token has since expired — a run refreshes it).
 
+For watching a *single* generation closely, `./bin/run-progress` projects the raw NDJSON stream down
+to one line per event worth acting on — each agent as it starts, rate-limit events, tool failures,
+and the terminal `result` with cost and models:
+
+```sh
+./bin/run-progress                    # newest log under ~/.claude-relay/logs
+./bin/run-progress <path-to-run.log>  # a specific run
+```
+
+```
+AGENT[9] ▸ gad-generation: implement tokens=324728 tools=169 plan=Survey>Generations>▸ gad-generation
+RATE_LIMIT five_hour status=allowed_warning utilization=0.9
+RESULT subtype=success is_error=False stop_reason=end_turn turns=10 cost=$14.73 dur=3829s
+```
+
+`tail -f` on the raw log is not a substitute: one `assistant` envelope can be tens of KB. Two
+projection rules in there are load-bearing and non-obvious — concurrent agents interleave their
+progress events (so reporting on "changed since the last event" looks exactly like a stuck loop), and
+not every `task_started` is a workflow. Both are pinned by `tests/test_progress.py`.
+
 ## Tests
 
 ```bash
@@ -286,9 +306,22 @@ is therefore tiered by cost, and only the last tier spends:
   far too expensive to provoke on purpose. It never records `assistant` envelopes — those carry
   tool output, which can contain repository contents or secrets (Invariant #5).
 
-  Enabling it needs the variable in **both** `~/.bashrc` and `~/.profile`: `.bashrc` covers
-  interactive terminal tabs but returns early when non-interactive, so it alone misses
-  cron/systemd/`nohup` runs, which is precisely what an unattended multi-day `claude-relay run` is.
+  Where the variable has to live, **measured 2026-07-27 rather than assumed** (an earlier version
+  of this paragraph claimed `.profile` covered the unattended case; it does not):
+
+  | launch | reads | tap |
+  |---|---|---|
+  | interactive terminal tab | `~/.bashrc` | on |
+  | login shell (`bash -lc`, ssh, tty login) | `~/.profile` | on |
+  | `bash -c`, `sh -c`, `nohup`, cron, systemd | **neither** | **off** |
+
+  `.bashrc` returns early when non-interactive and `.profile` is read only by *login* shells, so a
+  non-login non-interactive shell reads no rc file at all — and that is exactly how an unattended
+  multi-day `claude-relay run` gets launched. For those, set the variable in the launch itself
+  (`CLAUDE_RELAY_CAPTURE_DIR=... nohup claude-relay run ...`), the crontab line, or the systemd
+  unit's `Environment=`. Putting it in an rc file is not enough and fails silently, because the tap
+  is deliberately a no-op when the variable is unset — there is no error to notice.
+
   Verify with `./bin/rate-limit-probe report` after a run — if it reports zero records while runs
   have happened, the tap is not reaching the supervisor's environment.
 - **Tier 2** drives one seat's five-hour window to its wall. Cheap in the only sense that matters:
@@ -301,3 +334,36 @@ is therefore tiered by cost, and only the last tier spends:
 The pre-registered questions (fixed before any data was collected) are documented at the top of
 `relay/ratelimit_probe.py`, along with a standing prediction about a suspected window-awareness
 bug in `_force_cooldown()`, recorded so the data can refute it rather than be rationalized after.
+
+## What one generation actually costs
+
+Measured on the first real supervised run (2026-07-27, full writeup in DESIGN.md §4b): **one
+committed gad-kit generation**, 17 agents, 63.8 minutes, gate GREEN, 19/19 acceptance criteria.
+
+| | |
+|---|---|
+| dollars | **$14.73** |
+| `five_hour` points | **90** |
+| `seven_day` points | **9** |
+| per seat per week | **~4 generations** (95-point weekly ceiling) |
+
+Three things follow that are easy to get wrong:
+
+- **`seven_day` is the budget; `five_hour` is only a throttle.** Every token debits both, but the
+  five-hour window refills in hours while the weekly one takes a week — and *rotation cannot
+  manufacture weekly capacity*, since each seat carries its own. Exhausting a seat's five-hour costs
+  patience; exhausting its weekly costs up to seven days.
+- **A "5-hour window" is ~65-70 minutes of real generation work.** Burn measured a steady
+  ~1.45 points/minute, so a single seat cannot sustain much more than one generation per window. This
+  is why rotation is load-bearing rather than a convenience.
+- **The expensive model is not the one in the argv.** claude-relay spawns `opus` for the outer `-p`
+  turn, but that was 3% of the bill; gad-kit's `budget` profile put the work on `sonnet` (92%) and
+  `haiku` (5%). Cache reads were 98.6% of tokens and output tokens the majority of the cost, so cost
+  tracks token *kind*, not token count.
+
+Per-model figures for any captured run come from the tap:
+
+```sh
+CLAUDE_RELAY_CAPTURE_DIR=... claude-relay run     # collect (see the Tier-1 note above)
+./bin/rate-limit-probe report                     # rate-limit + result envelope summary
+```
