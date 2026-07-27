@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""Shim for the run-progress viewer, mirroring `bin/rate-limit-probe`'s clone-and-run flow.
+
+The viewer itself lives in `relay/progress.py`; this file only resolves its own real location
+(following any symlink) so `import relay` works from a plain checkout with no install.
+
+Deliberately NOT a `[project.scripts]` console entry point: this is an operator observability tool
+for watching a run in progress, not part of the supervisor's contract, and it should stay reachable
+only from a checkout.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+_SCRIPT_PATH = os.path.realpath(__file__)
+_REPO_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_PATH))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from relay.progress import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

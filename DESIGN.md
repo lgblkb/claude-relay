@@ -177,6 +177,14 @@ Phase 2 because it needs sound per-unit cost calibration, which v1 does not have
   Not implemented: Phase 2 still needs to read `result.modelUsage` per invocation, correlate it
   against the generation actually committed, and derive the per-unit cost — this note only
   records where the raw data lives so that work has a starting point.
+  **Calibrated (2026-07-27, §4b):** the first real supervised generation measured **$14.73 / 90
+  points of `five_hour` / 9 points of `seven_day` for one committed unit** — i.e. ~4 generations per
+  seat per week against the 95-point weekly ceiling — with a burn rate linear at ~1.45 points/min and
+  an exchange rate of ~10 `five_hour` points per `seven_day` point that holds across two very
+  different workloads. Phase 2 batching now has the per-unit cost it was waiting for. The one caveat
+  that matters for the model's *shape*: cache reads are 98.6% of tokens but output tokens are the
+  majority of the bill, so a model keyed on token count rather than token kind is wrong by an order
+  of magnitude.
   **Collection now exists (2026-07-27):** `relay/capture.py` is an opt-in passive tap
   (`CLAUDE_RELAY_CAPTURE_DIR`) that records every terminal `result` envelope — `modelUsage`
   included — from normal runs, at ~zero marginal cost, because `runner.py` already reads every
@@ -363,6 +371,162 @@ Tier-1 passive tap will eventually observe and a five-hour burn never can. Both 
 shape — inferring a general rule from a single observation — which is the exact failure the harness
 exists to prevent.
 
+### 4b. First end-to-end supervised run (2026-07-27, `live-run-01`)
+
+Everything in §3, §6, §7 and §8 — the loop, cooldown state, the notifier, config loading — had until
+this point been exercised **only by unit tests**. `~/.claude-relay/` did not exist on the box: the
+supervisor had never actually run. This section records the first real run, because the results move
+several assumptions in this document from "assumed" to "measured", and because the failures found are
+of a class that three prior adversarial reading passes did not produce.
+
+**Setup.** Throwaway target repo (`~/projects/gad-live-target`), a python-uv project whose
+`scripts/gate.sh` was verified GREEN *before* the run, so a gate failure during the generation would
+mean something real rather than a broken fixture. `.gad/` was scaffolded by hand from gad-kit's own
+templates rather than via `/gad-init` — that command is itself an async Workflow and cannot be driven
+by a bare `-p` prompt (see `command()`'s docstring), and the subject under test was claude-relay, not
+gad-kit's bootstrapper. `azim` was excluded from the pool (81% weekly, and it carries the operator's
+interactive session); `ayan` was the spend seat at a fresh `five_hour: 0`. `max_units = 1`, notify
+sink `stdout`, run launched detached via `setsid` so it would survive the operator's session.
+
+**Feasibility #4 — ANSWERED YES.** A full generation completes headlessly under `claude -p`
+supervision: **17 distinct agents, 63.8 min, `RESULT: COMPLETED-BATCH`**, `is_error=False`,
+`stop_reason=end_turn`, `api_error_status=None`, 10 turns. Committed, `gate: GREEN`, **19/19
+acceptance criteria met**, `nextGen` advanced 0 → 1. This was the longest-standing open question in
+the design and the claim everything else rests on. The blocking-`TaskOutput` mechanism held for the
+whole 64 minutes across two `verify → fix` rounds — the failure mode that killed gen 0 (ending the
+turn while the workflow still runs) did not recur.
+
+The supervisor's own contract also held: `max_units` counted the unit and stopped cleanly, the
+notification was recorded in `state.json`'s `lastNotified`, and the seat's cooldown was set from the
+**real** `resets_at` (21:40Z) rather than a fixed +5h, exactly as §6 requires.
+
+#### Cost, finally measured (this closes the §4 Phase-2 data gap)
+
+One generation, from the terminal `result` envelope's `modelUsage`:
+
+| model | input | output | cache read | cost | share |
+|---|---|---|---|---|---|
+| `claude-sonnet-5` | 666 | 276,864 | 20,155,836 | **$13.52** | 92% |
+| `claude-haiku-4-5` | 846 | 44,322 | 3,377,360 | $0.76 | 5% |
+| `claude-opus-5[1m]` | 19 | 1,191 | 278,335 | $0.45 | 3% |
+
+**One generation = $14.73, 90 points of `five_hour`, 9 points of `seven_day`.** Against a 95-point
+weekly ceiling that is **~4 generations per seat per week** — the planning number §4 said Phase 2
+needed, now available from one run.
+
+Corollaries worth keeping:
+
+- **`opus` is only the outer wrapper (3%).** The `-p` turn claude-relay spawns is opus, but gad-kit's
+  `budget` profile puts the actual work on sonnet + haiku. A pre-run worry that "the generation runs
+  on opus and will be ruinous" was wrong, and the argv's model is not the cost lever it looks like.
+- **Output tokens are 1.4% of tokens and the majority of the bill.** Cache reads are 98.6% of tokens
+  but cost ~10× less per token. Any cost model keyed on token *count* rather than token *kind* will
+  be wrong by an order of magnitude.
+- **Burn rate is linear enough to plan with**: 1.54 → 1.49 → 1.42 points/min measured at 11.7, 28.8
+  and 63.5 minutes. Concurrent phases (premortem ‖ refactor ‖ consolidate) did **not** spike it. A
+  five-hour window is therefore ~65-70 minutes of real generation work, which makes rotation
+  load-bearing rather than a convenience — "5-hour limit" badly undersells the consumption rate.
+- **The exchange rate is workload-insensitive.** ~10 points of `five_hour` per point of `seven_day`,
+  now measured three ways: the Tier-2 burn of uniform trivial prompts (16:2), and this generation at
+  two checkpoints (18:2, 90:9). Two workloads with completely different token mixes agree, which is
+  what makes the constant usable rather than anecdotal.
+
+#### Findings
+
+**1. The Tier-1 capture tap was silently off for every unattended launch.** §4a's note (and the
+README) claimed that putting `CLAUDE_RELAY_CAPTURE_DIR` in **both** `~/.bashrc` and `~/.profile`
+covered cron/systemd/`nohup`. Measured, it does not: `.bashrc` returns early when non-interactive and
+`.profile` is read only by *login* shells, so a non-login non-interactive shell — precisely how an
+unattended `claude-relay run` is launched — reads neither.
+
+| launch | reads | tap |
+|---|---|---|
+| interactive tab | `~/.bashrc` | on |
+| login shell (`bash -lc`, ssh) | `~/.profile` | on |
+| `bash -c`, `nohup`, cron, systemd | **neither** | **off** |
+
+This is the **second** instance of this bug class (the first: the Tier-2 recorder set the env var for
+the *child* while `record_line()` ran in the *parent*). Both share a shape worth naming: the tap is a
+deliberate no-op when unset, so a mis-plumbed environment produces **zero records and zero errors**.
+Silence is indistinguishable from "nothing to record". Any future activation path must be verified by
+asserting records appear, never by reading the config that should have produced them.
+
+**2. `severity` is absent at 90% utilization.** §4 says to rotate off when
+`percent >= ceiling_pct(seat)` **or** `severity != normal`. At `five_hour: 90` the live payload
+carried `severity: None` — so `percent` carried the entire decision and the `severity` clause
+contributed nothing. `rotate_off(u, 70.0)` returned True correctly, via percent alone. The gap is
+latent rather than active (the primary path works), but a future threshold written to key on
+`severity` would not fire on a seat this deep into its window.
+
+**3. Invariant #6 validated by accident — and it held.** The scaffold tracked `.coverage` by mistake
+(no `.gitignore`), so the tree was dirty after every gate run. The next iteration's triage refused:
+
+> `AWAITING_HUMAN` — working tree is dirty but is not safely attributable to a claude-relay-initiated
+> run (HEAD moved since the last known-clean baseline; no `generation-N/` scaffold or `.gad/` change
+> in the dirty set) — Invariant #6 forbids guessing here (never blanket-stash unrelated work)
+
+The dirty set was `.coverage` + `__pycache__` with zero `.gad/` paths, which is exactly the B10 audit
+fix's predicate ("satisfied only by an actual dirty path under `.gad/`, full stop"). An accidental
+fixture flaw produced the precise scenario that fix was written for, unprompted, and it behaved
+correctly rather than stashing unrelated work.
+
+**4. A gad-kit defect: `generations-index.json` records an unreachable commit.** The index reported
+`commit: "d2094fa"`, but the branch head was `077278e`. The reflog explains it:
+
+```
+077278e HEAD@{0}: commit (amend)
+d2094fa HEAD@{1}: commit (amend)   <-- the sha the index recorded
+8cde13d HEAD@{2}: commit
+```
+
+The consolidator commits, amends twice, and writes the index **between** amends, so the recorded sha
+is a dangling object — `git merge-base --is-ancestor d2094fa HEAD` fails. It resolves today only
+because unreachable objects survive until `gc`; after one, a generation's audit trail back to its
+code is broken. This is gad-kit's bug, not claude-relay's, but claude-relay must not start trusting
+`index.commit` to identify a generation's commit (`gadkit.py` already prefers git history and disk
+evidence over index bookkeeping, which is the right instinct for an independent reason).
+
+**5. The blast radius of a supervised generation is the machine, not the repo.** Children run with
+`--dangerously-skip-permissions`, and the agents demonstrably launched `local_bash` tasks running
+`find / -maxdepth 6 -iname "*.jsonl"` and `find /home/dias -iname "envelopes-*.jsonl"` — reaching
+well outside the target repo to locate real capture files. Nothing harmful happened (finding the real
+producer is what made the run correct, see finding 6), but this is a property to hold deliberately
+rather than discover. It also gave Invariant #5 an unplanned test: an unrelated agent read the
+capture files, and because `capture.py` never records `assistant` envelopes there was no tool output
+in them to surface.
+
+**6. The spec was wrong, and only execution against the real producer caught it.** The backlog entry
+for this generation (written by the same author as this document) specified capture records as flat
+envelopes with a top-level `type`. `capture.py` in fact writes a *wrapper* —
+`{captured_at, captured_at_unix, pid, seat, envelope: {...}}` — with the discriminator at
+`envelope.type`, and `modelUsage` keyed by model name rather than flat fields. gad-kit's framing
+review returned `NEEDS MAJOR REVISION (FRAME BROKEN)`, agents read `relay/capture.py`, `DESIGN.md`
+and `tests/test_capture.py`, re-authored the contract, and parked an open `ownerDecision` asking
+whether the autonomous redirect was intended.
+
+The aggravating detail: the author already knew the real shape — every ad-hoc analysis script written
+that same session contains `env = rec.get("envelope") or rec`, an unwrap added *because* the wrapper
+had been discovered. The spec was then written from memory and got it wrong anyway. The lesson
+generalizes past "static review misses bugs in existing code": **specs authored without executing
+against the real producer encode false assumptions**, and the cheapest place to catch that is an
+agent whose job is to go read the producer.
+
+**7. Green + 19/19 + adversarial review still shipped a misleading statistic.** The deliverable's
+`cache_read_share` computes `cache_read / (input + cache_read)`, excluding output tokens, and so
+prints `100.0%` where the meaningful figure is `98.6%`. The docstring documents the formula honestly,
+so this is a spec-intent mismatch rather than a hidden bug — the criterion "report the cache-read
+share of billed tokens" was met literally while the number stopped being useful, since output is both
+billed and the dominant cost. It survived a gate, 19/19 criteria, an adversarial reviewer and two
+verify rounds; it took about 30 seconds of running the tool on real data to notice. Acceptance
+criteria bound what gets checked, not whether the checked thing means what the reader will assume.
+
+#### Still untested after this run
+
+Rotation and cooldown *recovery* — `--once` performs a single invocation and never rotates. Exercising
+them needs a second seat in the pool, and the only candidate (`azim`) holds ~13 weekly points, about
+one generation's worth. That is a real spend for a real answer and should be a deliberate decision,
+not a side effect.
+
 ## 5. gad-kit brain: triage, outcome & the recovery-routing fix (`gadkit.py`)
 
 **Feasibility Critical finding:** `AGENT-DEAD` writes NOTHING to disk (the failed
@@ -502,6 +666,10 @@ Recovery never destroys unrelated user work (Invariant #6).
   + detector + config + install/verify + **minimal shellular notifier**. Runs on live
   named seats. `--dry-run`/`--once` for testing. First real run also validates the
   token-target on a full generation.
+  **Executed 2026-07-27 (§4b): feasibility #4 ANSWERED YES** — 17 agents, 63.8 min, committed,
+  gate GREEN, 19/19 criteria, on one `--once` invocation. Loop, config, cooldown-from-real-
+  `resets_at`, `max_units` enforcement and the notifier are no longer unit-test-only. Rotation
+  and cooldown *recovery* remain untested (a single invocation never rotates).
 - **Phase 2:** tmux monitor ✅ (observe-only: `monitor`/`seats`, live+fallback table) +
   standalone OAuth refresh (→ *idle*-seat truly-live table; still deferred) + calibrated
   `--max N` batching (stream-json token cost; still deferred).
@@ -517,5 +685,7 @@ Recovery never destroys unrelated user work (Invariant #6).
 - arch #1 snapshot method → dissolved (plain fns, §2). #2 provider seam → §2 future-seam.
   #3 vocab leak → no cost samples in v1 (§6). #4 detector single call → §5. #5 headroom
   in command → token_target param (§5/§8). #6 verify preflight → §11 (deferred).
-- feasibility #1 recovery routing (Critical) → §5. #2/#3 calibration poison → §4 deferred.
-  #3 token refresh → CONFIRMED (§0). #4 token target → §5/§8. #5 outcome buckets → §5.
+- feasibility #1 recovery routing (Critical) → §5. #2/#3 calibration poison → §4 deferred, then
+  **CALIBRATED 2026-07-27 (§4b)** from a real generation's `modelUsage`, sidestepping the
+  window-roll poison entirely. #3 token refresh → CONFIRMED (§0). #4 headless full generation →
+  **ANSWERED YES 2026-07-27 (§4b/§11)**. #4 token target → §5/§8. #5 outcome buckets → §5.
