@@ -235,14 +235,24 @@ The first real capture produced this envelope, and it changed three things:
   `inputTokens` / `outputTokens` / `cacheReadInputTokens` / `costUSD` / `contextWindow`, plus a
   top-level `total_cost_usd`, `api_error_status`, `stop_reason` and `terminal_reason`. Phase 2 has
   everything it needs; only the correlation and the cost model remain.
-- **A live HIGH-severity bug, now fixed.** `status: "allowed"` — the ordinary healthy value — was
-  absent from `_KNOWN_SAFE_RATE_LIMIT_STATUSES`, so routine events were classified UNRECOGNIZED
-  and rotated the seat off with a forced cooldown until `resetsAt`. On a `five_hour` event that
-  cools a usable seat for up to five hours; with a two-seat fleet the supervisor stalls itself.
-  The original reasoning — *"unknown → assume limited is the conservative direction"* — was
-  backwards for this signal, because this paragraph's own Invariant #2 makes disk and the endpoint
-  primary. A false positive here breaks rotation; a false negative defers to a mechanism that was
-  already authoritative.
+- **A live bug, now fixed.** `status: "allowed"` — the ordinary healthy value — was absent from
+  `_KNOWN_SAFE_RATE_LIMIT_STATUSES`, so it was classified UNRECOGNIZED and rotated the seat off
+  with a forced cooldown until `resetsAt`.
+
+  **Scope, stated precisely** (the first write-up of this overstated it): `classify()` reaches
+  `_rate_limit_event_action()` only in the `AGENT_DEAD_NONLIMIT` branch — `PROGRESSED`, `HIT_WALL`,
+  `AWAITING_HUMAN`, `BLOCKED` and `NO_BACKLOG` all return earlier. Ordinary successful runs were
+  never affected, and the fleet did not stall on the happy path. What it *did* do is turn every
+  non-limit agent death (crash, hang, timeout, refusal) into a multi-hour seat outage: the seat was
+  cooled until its window reset instead of retried. Two unrelated crashes park a two-seat fleet for
+  hours. **Crash amplification, not immediate stall.**
+
+  It is nonetheless a true signal inversion. That branch exists to distinguish *"died because of a
+  limit"* from *"died for some other reason"* — and an `allowed` event is positive evidence of
+  **not**-limit. Reading it as a limit flipped the signal's meaning rather than merely failing to
+  help. The original reasoning, *"unknown → assume limited is the conservative direction,"* was
+  backwards for this signal: Invariant #2 makes disk and the endpoint primary, so a false positive
+  here breaks recovery while a false negative defers to a mechanism that was already authoritative.
 
 Two schema notes from the same envelope:
 

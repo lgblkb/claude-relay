@@ -197,13 +197,25 @@ _RESULT_STATUS_TOKEN_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)")
 #                    "overageStatus":"rejected","overageDisabledReason":"org_level_disabled",
 #                    "isUsingOverage":false}          <-- note: NO utilization field at all
 #
-# `allowed` was MISSING here until 2026-07-27, and its absence was a live HIGH-severity bug rather
-# than a theoretical gap. `allowed` is the ordinary, healthy, nothing-is-wrong status — the most
-# common value there is — so `_rate_limit_event_action()` classified routine events as
-# "UNRECOGNIZED" and returned CONTINUE_ROTATE with a forced cooldown until the event's `resetsAt`.
-# On a five-hour event that cools a perfectly healthy seat for up to five hours. With a small fleet
-# every seat gets cooled almost immediately and the supervisor stalls itself completely — the exact
-# opposite of the availability it exists to provide.
+# `allowed` was MISSING here until 2026-07-27, and its absence was a live bug rather than a
+# theoretical gap. `allowed` is the ordinary, healthy, nothing-is-wrong status, so
+# `_rate_limit_event_action()` classified it as "UNRECOGNIZED" and returned CONTINUE_ROTATE with a
+# forced cooldown until the event's `resetsAt` (loop.py's `_force_cooldown`).
+#
+# SCOPE, stated precisely because the first write-up of this overstated it: `classify()` consults
+# this function ONLY inside the `outcome == "AGENT_DEAD_NONLIMIT"` branch. PROGRESSED, HIT_WALL,
+# AWAITING_HUMAN, BLOCKED and NO_BACKLOG all return earlier, so ordinary successful runs were never
+# affected and the fleet did not stall on the happy path.
+#
+# What it DID do is convert every non-limit agent death — a crash, a hang, a timeout, a refusal —
+# into a multi-hour seat outage: the run died for an unrelated reason, an `allowed` event was
+# present as it almost always is, and the seat was cooled until its window reset instead of being
+# retried. With a two-seat fleet, two unrelated crashes park everything for hours. Crash
+# amplification, not immediate stall.
+#
+# And note what makes it a true inversion: the whole purpose of that branch is to distinguish "died
+# because of a limit" from "died for some other reason." An `allowed` event is positive evidence of
+# NOT-limit. Reading it as a limit did not merely fail to help, it flipped the signal's meaning.
 #
 # The mistake was reasoning that "unknown -> assume limited" is the conservative direction. It is
 # not, and Invariant #2 is why: disk state and the usage endpoint are the PRIMARY deciders, and the
