@@ -305,6 +305,52 @@ the constant is operationally a *presence check*, and lowering it would change n
 `surpassedThreshold` can be **absent even when `utilization` is present** (2 events at exactly
 0.90), so it must never be used as a presence proxy.
 
+#### The rotation/cooldown split (implemented 2026-07-27)
+
+Q1's answer has a direct consequence. `loop.py`'s `AGENT_DEAD_NONLIMIT` branch is the *only*
+consumer of `detector.Action.resets_at`, and it passes that value to `_force_cooldown()` as the
+cooldown **boundary**. Deriving that boundary from a high-utilization event marks the seat unusable
+until its window resets — indefensible once you know the channel only ever warns.
+
+The weekly case shows the harm plainly: a `seven_day` event at 0.90 cooled the seat for **days**,
+discarding ~10% of still-spendable weekly quota, on the strength of a warning about a seat that was
+demonstrably still serving requests.
+
+So the two concerns are now separated:
+
+| signal | drives rotation | sets cooldown horizon |
+| --- | --- | --- |
+| `allowed*` at ≥ threshold (a **warning**) | yes | **no** — short `_TIMEOUT_COOLDOWN_S` fallback |
+| unrecognized status (possible **denial**) | yes | yes — keeps the event's `resetsAt` |
+| usage endpoint `severity: critical` / `percent: 100` | yes | yes — via `_record_usage()` |
+
+Rotation is unaffected: `_force_cooldown()` still applies its short default, which is all that branch
+needs to stop `pick_seat()` re-selecting the seat next iteration. Real exhaustion stays the usage
+endpoint's call — Invariant #2's primary path, verified against a genuinely walled seat.
+
+This was the standing prediction below. Q1 turned it from a suspicion into a straightforward
+consequence, so it was fixed on the reasoning rather than waiting for a `seven_day`-at-0.90
+observation. Two tests that had pinned the old behaviour were **inverted, not deleted**, each quoting
+its previous assertion so the change of contract stays legible.
+
+#### The wall, as the CLI presents it
+
+Operator observation (2026-07-27): on hitting the five-hour limit *interactively*, Claude Code states
+the limit and offers two choices — wait for the reset, or ask an admin to raise the quota. So the CLI
+has its own definitive wall handling, which is consistent with Q1: the refusal happens **before** a
+run produces envelopes, which is why no blocking `rate_limit_event` is observable.
+
+It also corroborates the Tier-0 schema findings. "Ask an admin to raise the quota" is the
+human-facing form of the overage fields the usage endpoint already exposes and `UsageSnapshot`
+discards — `extra_usage.user_disabled: true`, and on the event side
+`overageStatus: "rejected"` with `overageDisabledReason: "org_level_disabled"`. Those are the
+machine-readable version of the same condition.
+
+Not yet observed: what that wall looks like **headlessly**, where there is no prompt to answer. The
+likely locus is the terminal `result` envelope (`is_error`, `api_error_status`, `subtype`), of which
+42 *successful* samples now exist and zero walled ones. The Tier-1 tap records exactly that envelope,
+so the comparison will arrive on its own.
+
 #### Two mispredictions, left on the record
 
 The standing prediction above is **still untested**, and I was wrong twice about why. First I wrote

@@ -677,10 +677,20 @@ class RunOnceForcedCooldownTests(unittest.TestCase):
                 consecutive_agent_dead += 1
         self.assertGreaterEqual(consecutive_agent_dead, loop._MAX_CONSECUTIVE_AGENT_DEAD)
 
-    def test_a_rate_limit_events_real_resets_at_is_used_for_the_forced_cooldown(self) -> None:
-        """Blocker 1 item 2, end to end: `_force_cooldown()` must use the REAL structured
-        `resetsAt` a `rate_limit_event` provides (via `detector.Action.resets_at`), not the
-        blind `_TIMEOUT_COOLDOWN_S` guess, when one is available.
+    def test_a_weekly_warning_does_not_cool_the_seat_until_the_weekly_reset(self) -> None:
+        """EXPECTATION INVERTED 2026-07-27 by the rotation/cooldown split.
+
+        Was `test_a_rate_limit_events_real_resets_at_is_used_for_the_forced_cooldown`, asserting
+        `cooldownUntil == "2026-07-29T02:00:00+00:00"` — i.e. that a `seven_day` warning at 0.95
+        cooled this seat until the WEEKLY reset, roughly two days out.
+
+        That is the harm the split removes. Q1 (relay/ratelimit_probe.py) captured 42 events from
+        0.90 to 0.99 utilization with every call SUCCEEDING: the channel warns, it never denies. So
+        cooling a demonstrably-working seat for two days on a warning discarded ~10% of spendable
+        weekly quota for nothing.
+
+        The seat must still be ROTATED away from — hence the short `_TIMEOUT_COOLDOWN_S` fallback
+        below — but its real exhaustion is the usage endpoint's call, not this event's.
         """
         state = _state()
         rate_limit_envelope = json.dumps(
@@ -701,9 +711,18 @@ class RunOnceForcedCooldownTests(unittest.TestCase):
         result, seat = self._run_once_with_fake_runner(state, [rate_limit_envelope])
         assert result.action is not None
         self.assertEqual(result.action.kind, detector.CONTINUE_ROTATE)
-        self.assertEqual(result.action.resets_at, "2026-07-29T02:00:00+00:00")
+        self.assertIsNone(result.action.resets_at)
         entry = cooldown.get_seat_state(state, seat.path)
-        self.assertEqual(entry["cooldownUntil"], "2026-07-29T02:00:00+00:00")
+        # Still cooled — rotation requires it — but on the short default horizon, not two days out.
+        self.assertIsNotNone(entry["cooldownUntil"])
+        until = dt.datetime.fromisoformat(entry["cooldownUntil"])
+        horizon_s = (until - dt.datetime.now(dt.UTC)).total_seconds()
+        self.assertGreater(horizon_s, 0.0, "the seat must still be rotated away from")
+        self.assertLessEqual(
+            horizon_s,
+            loop._TIMEOUT_COOLDOWN_S + 60.0,
+            "a warning must never produce a cooldown longer than the short default guess",
+        )
 
 
 class ParkAndWaitRetryNotifyTests(unittest.TestCase):

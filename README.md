@@ -285,6 +285,12 @@ is therefore tiered by cost, and only the last tier spends:
   runs at ~zero marginal cost. This is what eventually catches a real `seven_day` wall, which is
   far too expensive to provoke on purpose. It never records `assistant` envelopes — those carry
   tool output, which can contain repository contents or secrets (Invariant #5).
+
+  Enabling it needs the variable in **both** `~/.bashrc` and `~/.profile`: `.bashrc` covers
+  interactive terminal tabs but returns early when non-interactive, so it alone misses
+  cron/systemd/`nohup` runs, which is precisely what an unattended multi-day `claude-relay run` is.
+  Verify with `./bin/rate-limit-probe report` after a run — if it reports zero records while runs
+  have happened, the tap is not reaching the supervisor's environment.
 - **Tier 2** drives one seat's five-hour window to its wall. Cheap in the only sense that matters:
   unused five-hour capacity is not banked, so burning the *tail* of a window on a seat you were
   not going to use costs only the weekly quota those tokens also debit. It bypasses the
