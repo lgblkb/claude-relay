@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""Shim for the rate-limit calibration harness, mirroring `bin/claude-relay`'s clone-and-run flow.
+
+The harness itself lives in `relay/ratelimit_probe.py`; this file only resolves its own real
+location (following any symlink) so `import relay` works from a plain checkout with no install.
+
+Deliberately NOT a `[project.scripts]` console entry point: this tool spends real quota on purpose,
+and it should be reachable only from a checkout by someone who went looking for it, never installed
+onto an operator's PATH next to `claude-relay` where it could be run by mistake.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+_SCRIPT_PATH = os.path.realpath(__file__)
+_REPO_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_PATH))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from relay.ratelimit_probe import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

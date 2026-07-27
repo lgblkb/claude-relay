@@ -189,21 +189,82 @@ _RESULT_LINE_RE = re.compile(r"^\s*RESULT\s*:\s*(.*)$", re.IGNORECASE)
 # a trailing explanation) is not part of the token.
 _RESULT_STATUS_TOKEN_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_-]*)")
 
-# The only `rate_limit_event.rate_limit_info.status` value ever actually observed live
-# (2026-07-26 probe: `{"status":"allowed_warning","rateLimitType":"seven_day","utilization":
-# 0.76,"surpassedThreshold":0.75}`). Nothing is known about what a genuinely BLOCKING event looks
-# like, nor how the five-hour ("session") window variant spells its status/rateLimitType — so the
-# policy below is inverted from the usual "unknown -> assume safe": any status OTHER than this
-# one is treated as a POTENTIAL limit and logged loudly, never silently swallowed. Extend this set
-# only after a live observation confirms a new value is genuinely non-limiting.
-_KNOWN_SAFE_RATE_LIMIT_STATUSES = frozenset({"allowed_warning"})
+# `rate_limit_event.rate_limit_info.status` values confirmed NON-limiting by live observation.
+#
+# 2026-07-26 probe: {"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.76,
+#                    "surpassedThreshold":0.75}
+# 2026-07-27 probe: {"status":"allowed","rateLimitType":"five_hour","resetsAt":1785105000,
+#                    "overageStatus":"rejected","overageDisabledReason":"org_level_disabled",
+#                    "isUsingOverage":false}          <-- note: NO utilization field at all
+#
+# `allowed` was MISSING here until 2026-07-27, and its absence was a live bug rather than a
+# theoretical gap. `allowed` is the ordinary, healthy, nothing-is-wrong status, so
+# `_rate_limit_event_action()` classified it as "UNRECOGNIZED" and returned CONTINUE_ROTATE with a
+# forced cooldown until the event's `resetsAt` (loop.py's `_force_cooldown`).
+#
+# SCOPE, stated precisely because the first write-up of this overstated it: `classify()` consults
+# this function ONLY inside the `outcome == "AGENT_DEAD_NONLIMIT"` branch. PROGRESSED, HIT_WALL,
+# AWAITING_HUMAN, BLOCKED and NO_BACKLOG all return earlier, so ordinary successful runs were never
+# affected and the fleet did not stall on the happy path.
+#
+# What it DID do is convert every non-limit agent death — a crash, a hang, a timeout, a refusal —
+# into a multi-hour seat outage: the run died for an unrelated reason, an `allowed` event was
+# present as it almost always is, and the seat was cooled until its window reset instead of being
+# retried. With a two-seat fleet, two unrelated crashes park everything for hours. Crash
+# amplification, not immediate stall.
+#
+# And note what makes it a true inversion: the whole purpose of that branch is to distinguish "died
+# because of a limit" from "died for some other reason." An `allowed` event is positive evidence of
+# NOT-limit. Reading it as a limit did not merely fail to help, it flipped the signal's meaning.
+#
+# The mistake was reasoning that "unknown -> assume limited" is the conservative direction. It is
+# not, and Invariant #2 is why: disk state and the usage endpoint are the PRIMARY deciders, and the
+# endpoint's own `ceiling_pct` already catches real limits. This event is a supplementary signal, so
+# a false positive here actively breaks rotation while a false negative merely defers to the
+# mechanism that was already authoritative. Costs are asymmetric in the opposite direction to what
+# the original comment assumed.
+#
+# Hence `_is_safe_rate_limit_status()` below also treats any `allowed*` status as safe: the prefix
+# means the platform ALLOWED the request, which cannot simultaneously be a denial. A future
+# `allowed_final_warning` must not stall the fleet on first sight.
+_KNOWN_SAFE_RATE_LIMIT_STATUSES = frozenset({"allowed", "allowed_warning"})
 
-# `utilization` is a 0..1 FRACTION (observed 0.76), NOT a percent. Even a KNOWN-safe status
-# ("allowed_warning" literally means "the request was allowed") is still usable as a signal on
-# its own once utilization is high enough — hand-picked, not derived from any confirmed second
-# threshold (the one field actually seen, `surpassedThreshold: 0.75`, is the threshold that
-# triggered THIS warning, not necessarily the point past which requests get denied). Guessing
-# toward "rotate and cool down" rather than "keep spending", per the audit's explicit direction.
+# Prefix rule backing the reasoning above. Kept separate from the exact-match set so the set stays a
+# literal record of what has actually been SEEN, while this encodes the semantic generalization.
+_SAFE_RATE_LIMIT_STATUS_PREFIX = "allowed"
+
+
+def _is_safe_rate_limit_status(status: str) -> bool:
+    """True when `status` is known or structurally certain not to be a denial.
+
+    Exact observations first, then the `allowed*` prefix — a status asserting the request was
+    allowed is not a report that it was blocked, whatever suffix follows.
+    """
+    return status in _KNOWN_SAFE_RATE_LIMIT_STATUSES or status.startswith(_SAFE_RATE_LIMIT_STATUS_PREFIX)
+
+# `utilization` is a 0..1 FRACTION (observed 0.76-0.99), NOT a percent. Even a KNOWN-safe status
+# ("allowed_warning" literally means "the request was allowed") is still usable as a signal on its
+# own once utilization is high enough.
+#
+# CALIBRATED 2026-07-27 by a Tier-2 burn (see relay/ratelimit_probe.py) that drove one seat's
+# five-hour window from 84% to 100%, capturing 42 events across 42 successful calls:
+#
+#   * 0.9 is a REAL platform threshold, not just our guess. Every event carrying `utilization` also
+#     carried `surpassedThreshold: 0.9`. The hand-picked value happened to match the platform's own.
+#   * BUT `utilization` is ABSENT below 0.9 — 13 `allowed` events had no `utilization` field at all,
+#     then 29 `allowed_warning` events carried 0.90 → 0.99. So `utilization >= 0.9` fires on the
+#     very FIRST event that carries the field, which makes this threshold operationally equivalent
+#     to `utilization is not None`. The number does no work beyond a presence check; lowering it
+#     would change nothing, and raising it is the only edit with any effect.
+#   * `surpassedThreshold` can be absent even when `utilization` is present (2 events at exactly
+#     0.90 had no `surpassedThreshold`), so it must never be relied on as a presence proxy.
+#   * utilization peaked at 0.99 and NEVER reached 1.0, and all 42 calls succeeded. Being past this
+#     threshold does not mean requests are being denied — see `_KNOWN_SAFE_RATE_LIMIT_STATUSES`
+#     above for why erring toward "rotate" is not the safe direction it appears to be.
+#
+# Kept at 0.9 anyway: it matches the platform's own warning threshold, and claude-relay's synthetic
+# `ceiling_pct` (default 70) rotates far earlier via the usage endpoint regardless, so this is a
+# backstop rather than the primary gate.
 _RATE_LIMIT_UTILIZATION_ROTATE_THRESHOLD = 0.9
 
 
@@ -386,13 +447,13 @@ def _rate_limit_event_action(tail: list[str]) -> Action | None:
     if signal is None:
         return None
     resets_at = _resets_at_iso(signal)
-    if signal.status is not None and signal.status not in _KNOWN_SAFE_RATE_LIMIT_STATUSES:
+    if signal.status is not None and not _is_safe_rate_limit_status(signal.status):
         print(
             f"[claude-relay] rate_limit_event reported an UNRECOGNIZED status {signal.status!r} "
             f"(rateLimitType={signal.rate_limit_type!r}, utilization={signal.utilization!r}) — "
-            "the only status ever actually observed live is 'allowed_warning'; treating this "
-            "conservatively as a genuine limit signal (rotate + cool down) rather than silently "
-            "assuming it is safe. If this value is confirmed non-limiting, add it to "
+            "statuses confirmed non-limiting live are 'allowed' and 'allowed_warning' (plus any "
+            "'allowed*'); treating this as a genuine limit signal (rotate + cool down). If this "
+            "value is confirmed non-limiting, add it to "
             "detector._KNOWN_SAFE_RATE_LIMIT_STATUSES.",
             file=sys.stderr,
         )

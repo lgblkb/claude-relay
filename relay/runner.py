@@ -65,7 +65,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import plugins
+from . import capture, plugins
 
 DEFAULT_TAIL_LINES = 200
 DEFAULT_RUN_TIMEOUT_S = 7200.0
@@ -159,16 +159,25 @@ def _split_lines(buf: bytes, chunk: bytes) -> tuple[list[bytes], bytes]:
     return parts[:-1], parts[-1]
 
 
-def _emit_line(log_file, tail: collections.deque[str], raw: bytes) -> None:  # noqa: ANN001
+def _emit_line(log_file, tail: collections.deque[str], raw: bytes, *, seat: str | None = None) -> None:  # noqa: ANN001
     """Decode one raw line (never raising on bad bytes — a non-UTF-8 locale in the child's
     output must not crash the supervisor), write it to the logfile, and record it in the
     in-memory tail. Module-level (not nested in `run()`) so tests can patch it to simulate a
     write failure partway through a real run, exercising the B5 kill-on-exception path.
+
+    Also offers the line to the Tier-1 rate-limit capture tap (`capture.record_line()`). That call
+    is a no-op unless `CLAUDE_RELAY_CAPTURE_DIR` is set, and it never raises — see relay/capture.py
+    for why the tap lives on this path (it is the one place every child NDJSON line is already
+    guaranteed to pass through) and why it can never break a run.
+
+    `seat` is keyword-only WITH a default so the existing tests that patch this function with a
+    3-positional-arg replacement keep working unchanged.
     """
     text = raw.decode("utf-8", errors="replace")
     log_file.write(text + "\n")
     log_file.flush()
     tail.append(text)
+    capture.record_line(text, seat=seat)
 
 
 def run(
@@ -247,7 +256,7 @@ def run(
                     break
                 lines, buf = _split_lines(buf, chunk)
                 for raw_line in lines:
-                    _emit_line(log_file, tail, raw_line)
+                    _emit_line(log_file, tail, raw_line, seat=seat_name)
                 if len(buf) > _MAX_UNTERMINATED_LINE_BYTES:
                     # Defensive cap: flush the oversized unterminated remainder now rather than
                     # letting it grow without bound for the rest of the run (see the constant's
@@ -257,11 +266,12 @@ def run(
                         log_file,
                         tail,
                         buf + b" [claude-relay: line exceeded the unterminated-line cap, flushed early]",
+                        seat=seat_name,
                     )
                     buf = b""
 
             if buf:  # final partial line with no trailing newline — do not discard it (B4)
-                _emit_line(log_file, tail, buf)
+                _emit_line(log_file, tail, buf, seat=seat_name)
                 buf = b""
 
             if timed_out:

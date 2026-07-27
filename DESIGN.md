@@ -177,6 +177,145 @@ Phase 2 because it needs sound per-unit cost calibration, which v1 does not have
   Not implemented: Phase 2 still needs to read `result.modelUsage` per invocation, correlate it
   against the generation actually committed, and derive the per-unit cost — this note only
   records where the raw data lives so that work has a starting point.
+  **Collection now exists (2026-07-27):** `relay/capture.py` is an opt-in passive tap
+  (`CLAUDE_RELAY_CAPTURE_DIR`) that records every terminal `result` envelope — `modelUsage`
+  included — from normal runs, at ~zero marginal cost, because `runner.py` already reads every
+  NDJSON line. Phase 2 no longer has to build its own collection path; it needs only the
+  correlation and the cost model. The same tap collects `rate_limit_event` envelopes for the
+  rate-limit calibration below, which is why one mechanism serves both.
+
+### 4a. Rate-limit signal calibration (`bin/rate-limit-probe`)
+
+`detector._KNOWN_SAFE_RATE_LIMIT_STATUSES` is a **one-element** frozenset and
+`_RATE_LIMIT_UTILIZATION_ROTATE_THRESHOLD` is a hand-picked `0.9`. Both encode a guess about an
+enum whose only ever-observed value is `allowed_warning` at `utilization: 0.76`. Rotation and
+forced multi-hour cooldowns ride on that guess, so it is the largest remaining uncalibrated
+constant in the design.
+
+It cannot be calibrated by a conventional test: `utilization` is a property of the account's
+window, not of the test fixture — it can only be *spent*, never *set*. Hence a cost-tiered harness
+(Tier 0 free / Tier 0.5 prices the spend / Tier 1 passive / Tier 2 spends), documented in full at
+the top of `relay/ratelimit_probe.py` together with six pre-registered questions.
+
+Two schema facts worth recording here, both from the 2026-07-27 Tier-0 run:
+
+- The endpoint sends ~**55** leaf fields; `UsageSnapshot.from_json()` keeps **three**
+  (`five_hour`, `seven_day`, `limits`). Everything else — `extra_usage.*` (overage state),
+  `spend.*` (with its own `percent`/`severity`), and per-model weekly gauges
+  `seven_day_opus` / `seven_day_sonnet` — is invisible to every rotation decision. The per-model
+  gauges are present-but-**null** on the observed account, so this is a future-proofing note, not
+  a live bug: if they ever populate, a seat whose *Opus* weekly is exhausted while its aggregate
+  weekly is not would look healthy to `session_percent()`.
+- The endpoint 429s readily — `Retry-After: 300` after a few dozen reads within minutes. The
+  harness therefore polls at the same 90s `poll_ttl` §4 already specifies, rather than inventing a
+  faster cadence for the tool most likely to run beside a live supervisor.
+
+**Standing prediction, recorded before the data exists** (so it can be refuted rather than
+rationalized): `_rate_limit_event_action()` ignores `rate_limit_type` and feeds the event's
+`resetsAt` straight into `_force_cooldown()`. A `seven_day` event at utilization ≥ 0.9 would
+therefore cool a seat until the **weekly** reset — days — discarding the remaining ~10% of weekly
+*and* a possibly-fresh five-hour window. Both the threshold and the cooldown horizon likely need
+to become window-aware.
+
+#### Results (2026-07-27 Tier-2 run)
+
+The first real capture produced this envelope, and it changed three things:
+
+```json
+{"status":"allowed","resetsAt":1785105000,"rateLimitType":"five_hour",
+ "overageStatus":"rejected","overageDisabledReason":"org_level_disabled",
+ "isUsingOverage":false}
+```
+
+- **Q3 — answered YES.** `rateLimitType: "five_hour"` exists, so the in-run signal genuinely
+  covers the window the rotation logic keys on. Previously only `seven_day` had ever been seen,
+  which had left open the possibility that the authoritative signal covered a window the
+  supervisor did not rotate on.
+- **Q6 — answered YES, richly.** The terminal `result` carries `modelUsage` with per-model
+  `inputTokens` / `outputTokens` / `cacheReadInputTokens` / `costUSD` / `contextWindow`, plus a
+  top-level `total_cost_usd`, `api_error_status`, `stop_reason` and `terminal_reason`. Phase 2 has
+  everything it needs; only the correlation and the cost model remain.
+- **A live bug, now fixed.** `status: "allowed"` — the ordinary healthy value — was absent from
+  `_KNOWN_SAFE_RATE_LIMIT_STATUSES`, so it was classified UNRECOGNIZED and rotated the seat off
+  with a forced cooldown until `resetsAt`.
+
+  **Scope, stated precisely** (the first write-up of this overstated it): `classify()` reaches
+  `_rate_limit_event_action()` only in the `AGENT_DEAD_NONLIMIT` branch — `PROGRESSED`, `HIT_WALL`,
+  `AWAITING_HUMAN`, `BLOCKED` and `NO_BACKLOG` all return earlier. Ordinary successful runs were
+  never affected, and the fleet did not stall on the happy path. What it *did* do is turn every
+  non-limit agent death (crash, hang, timeout, refusal) into a multi-hour seat outage: the seat was
+  cooled until its window reset instead of retried. Two unrelated crashes park a two-seat fleet for
+  hours. **Crash amplification, not immediate stall.**
+
+  It is nonetheless a true signal inversion. That branch exists to distinguish *"died because of a
+  limit"* from *"died for some other reason"* — and an `allowed` event is positive evidence of
+  **not**-limit. Reading it as a limit flipped the signal's meaning rather than merely failing to
+  help. The original reasoning, *"unknown → assume limited is the conservative direction,"* was
+  backwards for this signal: Invariant #2 makes disk and the endpoint primary, so a false positive
+  here breaks recovery while a false negative defers to a mechanism that was already authoritative.
+
+Two schema notes from the same envelope:
+
+- `overageStatus` / `overageDisabledReason` are undocumented additions. `overageStatus:
+  "rejected"` means the **org disabled overage spending**, not that the request was denied — a
+  substring scan for `"rejected"` would read a healthy event as a wall.
+- the event carried **no `utilization` and no `surpassedThreshold` at all**. Those appear only
+  once a warning threshold is crossed, so `_RATE_LIMIT_UTILIZATION_ROTATE_THRESHOLD` cannot fire
+  on a plain `allowed` event regardless of its value.
+
+#### Q1 answered — the event channel cannot report a denial
+
+A second Tier-2 burn drove one five-hour window from **84% → 100%**, capturing **42 events across
+42 calls** for **$1.49** and **+2 points** of weekly quota. Every call **succeeded**: `is_error`
+false, `subtype: success`, `api_error_status: null`, `stop_reason: end_turn`, throughout.
+
+| status | rateLimitType | utilization | count |
+| --- | --- | --- | --- |
+| `allowed` | `five_hour` | *absent* | 13 |
+| `allowed_warning` | `five_hour` | 0.90 → 0.99 | 29 |
+
+The event stream warned continuously and **never emitted a blocking status**; `utilization` peaked
+at 0.99 and never reached 1.0. The wall then materialized in a *different* session minutes later.
+
+So Q1's premise was wrong. There is no "walled run" whose envelopes can be inspected, because **the
+run that gets refused never starts**. `rate_limit_event` is a *warning* channel, full stop.
+
+The authoritative wall signal is the **usage endpoint**, verified against the genuinely walled seat:
+
+```json
+five_hour {"utilization": 100.0, "resets_at": "2026-07-26T22:30:00Z"}
+limits[]  {"kind":"session","percent":100,"severity":"critical","is_active":true}
+```
+
+`severity: "critical"` is a third observed value (after `normal` and `warning` at 82%).
+`rotate_off()` gates on `severity != "normal"`, so it routes correctly with no enum change —
+`session_utilization()`, `session_percent()`, `near_cap()` and `rotate_off(high=90)` all reported
+the wall correctly. **Invariant #2's primary path works as designed.**
+
+This is also the strongest justification for the `_KNOWN_SAFE_RATE_LIMIT_STATUSES` fix above: if the
+event channel *cannot* report a denial, then treating an unfamiliar status **as** a denial can only
+ever produce false positives — which is precisely the force-cooling bug.
+
+#### Q4 answered — the threshold constant does less than it appears
+
+`0.9` is a **real platform threshold**: every event carrying `utilization` also carried
+`surpassedThreshold: 0.9`, so the hand-picked value happened to match. But `utilization` is
+**absent below 0.9 entirely**, so `>= 0.9` fires on the first event that carries the field at all —
+the constant is operationally a *presence check*, and lowering it would change nothing. Also,
+`surpassedThreshold` can be **absent even when `utilization` is present** (2 events at exactly
+0.90), so it must never be used as a presence proxy.
+
+#### Two mispredictions, left on the record
+
+The standing prediction above is **still untested**, and I was wrong twice about why. First I wrote
+that "Q3 and Q4 settle it" — they do not; Q3 says nothing about the cooldown horizon. Then I wrote
+that Q4 might be unreachable because five-hour events omit `utilization` — also wrong; they carry it
+above 0.9, and I had generalized from the single pre-burn `allowed` event.
+
+Testing it needs a `seven_day` event at ≥ 0.9, i.e. a nearly-exhausted **weekly** window, which the
+Tier-1 passive tap will eventually observe and a five-hour burn never can. Both errors share one
+shape — inferring a general rule from a single observation — which is the exact failure the harness
+exists to prevent.
 
 ## 5. gad-kit brain: triage, outcome & the recovery-routing fix (`gadkit.py`)
 

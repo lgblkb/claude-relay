@@ -1,4 +1,4 @@
-"""LIVE test for the `LS-3-claude-subprocess` seam declared in `.gad/live-seams.json`. Spawns
+"""LIVE test for the `LS-3-claude-subprocess` seam. Spawns
 a REAL `claude` process (via `runner.run()`) against a real seat and a throwaway git repo —
 no mock.
 
