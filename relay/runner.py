@@ -45,6 +45,12 @@ and `process.poll()` at least once a second even while the child is silent — c
 at once. Whatever is left in the buffer with no trailing newline (at EOF *or* at the deadline) is
 flushed as a final partial line rather than discarded, closing B4.
 
+B4's kernel-pipe layer (2026-07-27 follow-up): the fix above covers our own `buf` remainder, but
+TWO of the read loop's `break`s can still leave already-arrived bytes unread in the *kernel* pipe
+(the not-ready-then-exited branch and the deadline branch). A single bounded, strictly non-blocking
+`_drain_pipe()` on the way out of the loop closes that layer for every exit path — see its
+docstring for the two windows and why each one loses exactly the bytes that matter most.
+
 B5 (no exception between `Popen` and the kill sites may orphan the process group — ENOSPC on the
 log write, a `KeyboardInterrupt`, anything): the entire read loop is now wrapped in a
 `try/finally` whose `finally` unconditionally checks `process.poll()` and kills the process group
@@ -93,6 +99,14 @@ _READ_CHUNK_BYTES = 65536
 # in practice (real `stream-json` lines are one compact JSON object each, rarely anywhere near
 # this size) but cheap to bound.
 _MAX_UNTERMINATED_LINE_BYTES = 1_000_000
+
+# Ceiling on the final best-effort drain (`_drain_pipe()`, 2026-07-27). Bounded for the same
+# reason the read loop's waits are bounded: on the deadline path the child (or a grandchild) may
+# still be alive and writing, and an unbounded drain would hand a runaway producer the ability to
+# keep the supervisor in this loop indefinitely — exactly the hang the deadline exists to end.
+# One cap's worth is plenty: the drain exists to recover the LAST few already-received lines, not
+# to transcribe a whole runaway stream.
+_MAX_FINAL_DRAIN_BYTES = 1_000_000
 
 # How long, after the read loop ends (EOF or deadline), we give the process to actually exit
 # before concluding it needs a SIGKILL. Parameterized (not just a literal `10`) so tests can
@@ -157,6 +171,51 @@ def _split_lines(buf: bytes, chunk: bytes) -> tuple[list[bytes], bytes]:
     data = buf + chunk
     parts = data.split(b"\n")
     return parts[:-1], parts[-1]
+
+
+def _drain_pipe(stdout_fd: int, max_bytes: int = _MAX_FINAL_DRAIN_BYTES) -> bytes:
+    """Non-blocking, bounded drain of whatever is ALREADY sitting in the kernel pipe. Called once
+    after the read loop ends, on every exit path.
+
+    Why this is needed (2026-07-27 audit): the read loop has two `break`s that leave the pipe
+    unread, both of them reachable with bytes still buffered in it —
+
+      * the not-ready branch, `if not ready: if process.poll() is not None: break`. `select()`
+        reporting not-ready only means the fd was empty at the instant the timeout expired; bytes
+        landing in the gap between that return and the `poll()` call are then abandoned, because
+        `poll()` going non-None takes us straight out of the loop. The window is microseconds
+        against a 1s poll interval, so this is rare (order 1e-4 per run) rather than routine.
+      * the deadline branch, `if remaining <= 0: break`, checked at the TOP of the loop — anything
+        the child wrote after the previous iteration's last `os.read()` is still in the pipe.
+
+    Both discard the LAST bytes received, which is precisely where a limit signature or a final
+    `result` envelope sits — the same class of loss as B4, one layer further out. B4's fix covered
+    our own `buf` remainder and the `BufferedReader`'s internal buffer; neither covers the kernel
+    pipe. `select(..., 0)` makes every poll here strictly non-blocking, so this cannot extend a
+    timed-out run, and `max_bytes` bounds the work against a still-live producer.
+
+    Returns the drained bytes (possibly empty), for the caller to feed through `_split_lines()`
+    exactly like any other chunk. Never raises: a drain failure must not turn a completed run into
+    an exception.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while total < max_bytes:
+        try:
+            ready, _, _ = select.select([stdout_fd], [], [], 0)
+        except OSError:  # fd already closed / otherwise unusable — nothing recoverable
+            break
+        if not ready:
+            break
+        try:
+            chunk = os.read(stdout_fd, _READ_CHUNK_BYTES)
+        except (BlockingIOError, OSError):
+            break
+        if chunk == b"":  # EOF
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
 
 
 def _emit_line(log_file, tail: collections.deque[str], raw: bytes, *, seat: str | None = None) -> None:  # noqa: ANN001
@@ -269,6 +328,16 @@ def run(
                         seat=seat_name,
                     )
                     buf = b""
+
+            # Every path out of the read loop above (EOF, deadline, poll()-detects-exit) lands
+            # here. Recover anything already in the kernel pipe that those breaks would otherwise
+            # abandon, BEFORE flushing the partial remainder and before appending the TIMEOUT note,
+            # so the log keeps the child's real output in order ahead of our own annotations.
+            residual = _drain_pipe(stdout_fd)
+            if residual:
+                lines, buf = _split_lines(buf, residual)
+                for raw_line in lines:
+                    _emit_line(log_file, tail, raw_line, seat=seat_name)
 
             if buf:  # final partial line with no trailing newline — do not discard it (B4)
                 _emit_line(log_file, tail, buf, seat=seat_name)

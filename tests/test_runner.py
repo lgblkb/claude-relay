@@ -10,6 +10,7 @@ Each script is short-lived and bounded so the suite stays fast.
 from __future__ import annotations
 
 import os
+import select
 import stat
 import tempfile
 import time
@@ -285,6 +286,130 @@ class UnterminatedLineCapTests(_FakeClaudeTestCase):
         # (the trailing final empty `echo` line does not contribute any 'A's).
         total_a_count = sum(line.count("A") for line in result.tail)
         self.assertEqual(total_a_count, 250)
+
+
+class FinalPipeDrainTests(_FakeClaudeTestCase):
+    """2026-07-27 audit: two of the read loop's `break`s exit with bytes still unread in the
+    KERNEL pipe, discarding the last output the child produced (`_drain_pipe()`'s docstring has
+    the full analysis). B4's fix covered our own `buf` and the `BufferedReader`'s buffer; neither
+    reaches the kernel pipe, so this is the same loss one layer further out.
+
+    Motivation is a real observation, not a hypothetical: a live run once returned `returncode 0`
+    with a written logfile and an EMPTY tail (tests_live/test_claude_runner_live.py). This is not
+    the confirmed cause — the odds are far too low (order 1e-4/run) for a first-try sighting, and
+    the leading explanation remains a first-launch OAuth refresh — but it IS an independent way to
+    produce that exact signature, so it gets closed on its own merits rather than left as a
+    candidate explanation for a flake.
+    """
+
+    def test_drain_pipe_recovers_bytes_already_sitting_in_the_pipe(self) -> None:
+        """`_drain_pipe()` in isolation, on a real pipe: it returns buffered bytes, stops at
+        not-ready instead of blocking, and honors its byte cap."""
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(lambda: os.close(read_fd))
+        os.set_blocking(read_fd, False)
+        os.write(write_fd, b"alpha\nbeta\npart")
+
+        self.assertEqual(runner_mod._drain_pipe(read_fd), b"alpha\nbeta\npart")
+        # Pipe is empty now and the write end is still OPEN, so there is no EOF to detect — a
+        # blocking implementation would hang here instead of returning promptly.
+        self.assertEqual(runner_mod._drain_pipe(read_fd), b"")
+
+        os.write(write_fd, b"x" * 5000)
+        capped = runner_mod._drain_pipe(read_fd, max_bytes=10)
+        self.assertGreater(len(capped), 0)
+        # One `os.read()` of up to _READ_CHUNK_BYTES may overshoot a small cap; the contract is
+        # that it STOPS, not that it lands exactly on the boundary.
+        self.assertLessEqual(len(capped), runner_mod._READ_CHUNK_BYTES)
+        os.close(write_fd)
+
+    def test_a_closed_fd_drains_to_empty_rather_than_raising(self) -> None:
+        """Never raises: a drain failure must not turn a completed run into an exception."""
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        os.close(read_fd)
+        self.assertEqual(runner_mod._drain_pipe(read_fd), b"")
+
+    def _run_with_stale_select(self, script_body: str, **kwargs) -> runner_mod.RunResult:  # noqa: ANN003
+        """Run a real child, but force the read loop's `select()` to report not-ready from the
+        moment the child has produced its output onward — the state both loss windows share: bytes
+        sitting in the pipe while the loop believes the fd is empty.
+
+        Forced rather than raced because the real window is microseconds against a 1s poll
+        interval: reproducing it by timing alone would need thousands of runs and still be flaky.
+        The child, the pipe, the process group and the lifecycle are all real — only `select`'s
+        answer is stubbed, and only for the loop's own polls.
+        """
+        _write_fake_claude(self.bin_dir, script_body)
+        real_select = select.select
+        state = {"settled": False}
+
+        def fake_select(rlist, wlist, xlist, timeout=None):  # noqa: ANN001, ANN202
+            # `_drain_pipe()` is the code under test and polls with `timeout=0` — that is what
+            # makes it strictly non-blocking — so those calls must reach the REAL `select`.
+            # Stubbing them too would disable the fix and make the test pass for the wrong reason.
+            # Learned the hard way: the first draft patched both and reproduced the empty tail
+            # WITH the fix in place.
+            if timeout == 0:
+                return real_select(rlist, wlist, xlist, timeout)
+            if not state["settled"]:
+                time.sleep(0.5)  # let the child write (and, where scripted, exit)
+                state["settled"] = True
+            return ([], [], [])
+
+        with mock.patch.object(runner_mod.select, "select", fake_select):
+            result = runner_mod.run(
+                [],
+                repo=self.repo,
+                config_dir=self.config_dir,
+                log_dir=self.log_dir,
+                seat_name="test-seat",
+                env=self._env(),
+                **kwargs,
+            )
+        self.assertIs(select.select, real_select)  # patch fully undone
+        return result
+
+    def test_output_arriving_in_the_not_ready_then_exited_window_is_not_lost(self) -> None:
+        """Window 1 — the not-ready-then-exited branch: the loop learns the fd was empty at that
+        instant, then finds `poll()` non-None and breaks straight out, while the child's bytes are
+        already in the pipe. Pre-fix this reports SUCCESS with an EMPTY tail — the exact signature
+        of the live observation that motivated the audit.
+        """
+        result = self._run_with_stale_select(
+            'echo "first"\necho "LIMIT SIGNATURE"\nexit 0',
+            timeout_s=5.0,
+            reap_grace_s=0.5,
+        )
+
+        # Exited on its own (not killed) => the loop left via the poll()-detects-exit branch.
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.tail, ["first", "LIMIT SIGNATURE"])
+        self.assertEqual(
+            result.log_path.read_text(encoding="utf-8").splitlines(),
+            ["first", "LIMIT SIGNATURE"],
+        )
+
+    def test_output_written_before_the_deadline_break_is_not_lost(self) -> None:
+        """Window 2 — the deadline branch, which is NOT rare: every timed-out run takes it.
+        `remaining <= 0` is checked at the TOP of the loop, so bytes that arrived since the last
+        `os.read()` are still in the pipe when it breaks. A timed-out run is exactly when the tail
+        matters most — it is the evidence for why the session hung.
+
+        The child stays alive (`sleep 30`, stdout never closed), so `poll()` stays None and the
+        deadline is the ONLY way out of the loop; `timed_out` below confirms which branch ran.
+        """
+        result = self._run_with_stale_select(
+            'echo "RESULT: last line before the hang"\nsleep 30',
+            timeout_s=1.0,
+            reap_grace_s=0.3,
+        )
+
+        self.assertTrue(result.timed_out)
+        self.assertIn("RESULT: last line before the hang", result.tail)
+        # Ordering contract: the child's real output precedes our synthetic TIMEOUT annotation.
+        self.assertTrue(result.tail[-1].startswith("[claude-relay] TIMEOUT"), result.tail)
 
 
 if __name__ == "__main__":
