@@ -7,9 +7,11 @@ branch (genuinely offline) or `send_telegram`/`get_updates` themselves mocked ou
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -304,6 +306,56 @@ class PollTelegramResolveCommitStatusTests(unittest.TestCase):
         # ...but a failure to commit must never be silently reported as an ordinary resolution.
         self.assertIn("WARNING", reply)
         self.assertIn("FAILED", reply)
+
+
+class _FlushRecordingStream(io.StringIO):
+    """A stdout/stderr stand-in that records whether `flush()` was ever called on it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.flush_calls = 0
+
+    def flush(self) -> None:
+        self.flush_calls += 1
+        super().flush()
+
+
+class DispatchFlushesEveryConsoleSinkTests(unittest.TestCase):
+    """Every stdout/stderr path in `dispatch()` must flush.
+
+    Regression for a MEASURED failure, not a hypothetical one (2026-07-27, DESIGN.md §4c): the
+    supervisor's unattended deployment redirects stdout to a file, where Python block-buffers at
+    ~8KB rather than line-buffering as on a TTY. A live `all-exhausted` notification was dispatched
+    (proved by its key landing in `state.lastNotified`, which only happens on a True return) into a
+    logfile that stayed 0 bytes, and the subsequent SIGTERM discarded the buffer instead of flushing
+    it. The operator's only record of the event was destroyed.
+
+    These assert on `flush()` being CALLED rather than on the text arriving, because a StringIO
+    shows the text either way — the buffering is in the real file object, so the observable that
+    actually distinguishes fixed from broken is the flush call itself.
+    """
+
+    def _dispatch_capturing(self, cfg: Config, stream_name: str) -> _FlushRecordingStream:
+        stream = _FlushRecordingStream()
+        with mock.patch.object(sys, stream_name, stream):
+            self.assertTrue(notify.dispatch(cfg, "hello"))
+        return stream
+
+    def test_stdout_sink_flushes(self) -> None:
+        stream = self._dispatch_capturing(Config(notify_sink="stdout"), "stdout")
+        self.assertGreaterEqual(stream.flush_calls, 1)
+        self.assertIn("hello", stream.getvalue())
+
+    def test_telegram_without_credentials_flushes_its_stdout_fallback(self) -> None:
+        cfg = Config(notify_sink="telegram", telegram_bot_token=None, telegram_chat_id=None)
+        stream = self._dispatch_capturing(cfg, "stdout")
+        self.assertGreaterEqual(stream.flush_calls, 1)
+        self.assertIn("hello", stream.getvalue())
+
+    def test_unknown_sink_flushes_its_stderr_fallback(self) -> None:
+        stream = self._dispatch_capturing(Config(notify_sink="no-such-sink"), "stderr")
+        self.assertGreaterEqual(stream.flush_calls, 1)
+        self.assertIn("hello", stream.getvalue())
 
 
 if __name__ == "__main__":
