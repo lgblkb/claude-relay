@@ -14,7 +14,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -238,6 +238,89 @@ class ResolveCommandTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("WARNING", stderr)
         self.assertIn("FAILED", stderr)
+
+
+class EnableDisableTruthfulnessTests(unittest.TestCase):
+    """`enable`/`disable` must not claim an effect they cannot deliver.
+
+    MEASURED (2026-07-27, DESIGN.md §4c). `claude-relay enable azim` printed:
+
+        seat 'azim' was already enabled.
+          note: no seat named 'azim' discovered yet — setting saved, applies if it appears.
+
+    for a seat that existed on disk and was config-excluded. BOTH lines were false, and the operator
+    went on believing azim was pooled. Two distinct causes:
+
+      * the "discovered" probe passed `cfg.effective_exclude()` into `discover_seats()`, so every
+        config-`exclude`d seat reads as nonexistent — and an excluded seat is exactly what someone
+        runs `enable` for;
+      * `disabledSeats` (what this command writes) and config.toml's `[seats.<name>] exclude`/`main`
+        (which filters at discovery) are INDEPENDENT gates. Clearing the first while the second still
+        holds leaves the seat out of rotation, and nothing said so.
+    """
+
+    def _seat_dir(self, home: Path, name: str) -> None:
+        seat = home / f".claude-{name}"
+        seat.mkdir(parents=True)
+        (seat / ".claude.json").write_text("{}", encoding="utf-8")
+
+    def _toggle(self, home: Path, cfg_path: Path, verb: str, seat: str) -> str:
+        # `--config` lives on the TOP-LEVEL parser, so it must precede the subcommand.
+        args = cli.build_parser().parse_args(["--config", str(cfg_path), verb, seat])
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False), redirect_stdout(buf):
+            rc = cli.cmd_enable(args) if verb == "enable" else cli.cmd_disable(args)
+        self.assertEqual(rc, 0)
+        return buf.getvalue()
+
+    def _setup(self, tmp: str, *, exclude_azim: bool) -> tuple[Path, Path]:
+        home = Path(tmp) / "home"
+        home.mkdir()
+        self._seat_dir(home, "azim")
+        cfg_path = Path(tmp) / "config.toml"
+        # No `state_path` here: it is NOT a TOML key, it defaults from `Path.home()` — which the
+        # patched HOME already redirects into this tmpdir. Writing it here would be a silent no-op,
+        # and the real state file is what would get mutated if HOME were not patched.
+        body = f'repo = "{tmp}"\n'
+        if exclude_azim:
+            body += "\n[seats.azim]\nexclude = true\n"
+        cfg_path.write_text(body, encoding="utf-8")
+        return home, cfg_path
+
+    def test_enabling_a_config_excluded_seat_warns_that_config_still_excludes_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, cfg_path = self._setup(tmp, exclude_azim=True)
+            out = self._toggle(home, cfg_path, "enable", "azim")
+        self.assertIn("WARNING", out)
+        self.assertIn("config.toml", out)
+        self.assertIn("[seats.azim]", out)
+
+    def test_a_config_excluded_seat_is_not_reported_as_undiscovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, cfg_path = self._setup(tmp, exclude_azim=True)
+            out = self._toggle(home, cfg_path, "enable", "azim")
+        self.assertNotIn("discovered yet", out)
+
+    def test_enabling_a_pooled_seat_warns_about_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, cfg_path = self._setup(tmp, exclude_azim=False)
+            out = self._toggle(home, cfg_path, "enable", "azim")
+        self.assertNotIn("WARNING", out)
+        self.assertNotIn("discovered yet", out)
+
+    def test_a_genuinely_absent_seat_still_reports_undiscovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home, cfg_path = self._setup(tmp, exclude_azim=False)
+            out = self._toggle(home, cfg_path, "enable", "nosuchseat")
+        self.assertIn("discovered yet", out)
+
+    def test_disable_does_not_emit_the_enable_only_warning(self) -> None:
+        # `disable` on a config-excluded seat is redundant, not misleading: the seat ends up out of
+        # rotation either way, which is what the operator asked for.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, cfg_path = self._setup(tmp, exclude_azim=True)
+            out = self._toggle(home, cfg_path, "disable", "azim")
+        self.assertNotIn("WARNING", out)
 
 
 if __name__ == "__main__":

@@ -170,14 +170,29 @@ def dispatch(config: Config, message: str) -> bool:
     """Send `message` via `config.notify_sink`, degrading gracefully (never raising) if the
     chosen sink is misconfigured — Invariant #3 (graceful degradation is normal) extends to
     notification failures: a bad Telegram token must never crash the rotation loop.
+
+    Every stdout/stderr path below flushes. MEASURED 2026-07-27 (DESIGN.md §4c): the supervisor's
+    normal deployment redirects stdout to a file (`launch-*.sh`, `nohup`, `setsid`, systemd), where
+    Python block-buffers at ~8KB instead of line-buffering as it does on a TTY. A loop that emits a
+    few lines per wake can therefore sit for days below the buffer threshold with an EMPTY logfile,
+    and a `SIGTERM` then discards the buffer rather than flushing it — which is exactly what
+    happened during the live test: the one `all-exhausted` notification that fired was recorded in
+    `state.lastNotified` (proving `dispatch()` ran and returned True) while its logfile stayed 0
+    bytes. The operator's only record of the event was destroyed by the buffer.
+
+    This is not cosmetic. `notify()` marks a key notified on a True return, so an unflushed sink
+    means the state says "the operator was told" about a message that never reached durable storage.
     """
     sink = (config.notify_sink or "telegram").strip().lower()
     if sink == "stdout":
-        print(message)
+        print(message, flush=True)
         return True
     if sink == "telegram":
         if not config.telegram_bot_token or not config.telegram_chat_id:
-            print(f"[claude-relay] notify_sink=telegram but bot_token/chat_id missing; stdout: {message}")
+            print(
+                f"[claude-relay] notify_sink=telegram but bot_token/chat_id missing; stdout: {message}",
+                flush=True,
+            )
             return True
         return send_telegram(config.telegram_bot_token, config.telegram_chat_id, message)
     if sink == "command":
@@ -186,7 +201,11 @@ def dispatch(config: Config, message: str) -> bool:
         return _dispatch_webhook(config, message)
     if sink == "shellular":
         return _dispatch_shellular(config, message)
-    print(f"[claude-relay] unknown notify_sink {sink!r}; stdout fallback:\n{message}", file=sys.stderr)
+    print(
+        f"[claude-relay] unknown notify_sink {sink!r}; stdout fallback:\n{message}",
+        file=sys.stderr,
+        flush=True,
+    )
     return True
 
 

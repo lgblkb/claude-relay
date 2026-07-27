@@ -282,15 +282,38 @@ def cmd_adopt(args: argparse.Namespace) -> int:
 
 
 def _toggle_seat(args: argparse.Namespace, *, disable: bool) -> int:
+    """`disable`/`enable` toggle `state.disabledSeats` — which is only ONE of the two mechanisms
+    that keep a seat out of rotation. The other is config.toml's `[seats.<name>] exclude`/`main`,
+    which filters at DISCOVERY (`Config.effective_exclude()`) and which this command cannot touch.
+    Both messages below exist because their absence actively misled an operator (MEASURED
+    2026-07-27, DESIGN.md §4c): `enable azim` printed "was already enabled" plus "no seat named
+    'azim' discovered yet" for a seat that plainly existed on disk and was config-excluded — two
+    false statements, and the operator proceeded believing the seat was pooled.
+    """
     cfg = _load_config(args)
     state = cooldown.load_state(cfg.state_path)
     changed = cooldown.set_seat_disabled(state, args.seat, disable)
     cooldown.save_state(cfg.state_path, state)
     verb = "disabled" if disable else "enabled"
     print(f"seat {args.seat!r} {verb}." if changed else f"seat {args.seat!r} was already {verb}.")
-    known = {s.name for s in fleet.discover_seats(cfg.effective_exclude())}
+
+    # ALL real seats, NOT the rotation-filtered set — mirroring `cmd_share()` below. Passing
+    # `effective_exclude()` here made every config-`exclude`d seat report as undiscovered, and an
+    # excluded seat is precisely what `enable` is reached for.
+    known = {s.name for s in fleet.discover_seats(exclude=None)}
     if args.seat not in known:
         print(f"  note: no seat named {args.seat!r} discovered yet — setting saved, applies if it appears.")
+    elif not disable and args.seat in set(cfg.effective_exclude()):
+        shown_path = (
+            Path(args.config).expanduser()
+            if getattr(args, "config", None)
+            else config_mod.default_config_path()
+        )
+        print(
+            f"  WARNING: {args.seat!r} is still excluded by config.toml "
+            f"([seats.{args.seat}] exclude/main), which this command cannot change — it will stay "
+            f"out of rotation. Edit {shown_path} to admit it."
+        )
     return 0
 
 

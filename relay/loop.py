@@ -27,6 +27,12 @@ from . import usage as usage_mod
 from .config import Config
 
 _MAX_CONSECUTIVE_AGENT_DEAD = 3
+
+# The `lastNotified` dedupe key for "every seat is exhausted or cooling". A NAMED constant, used by
+# both the notify site and the clear site below, because the bug this fixes was born of a bare
+# string literal that existed at exactly one of those two places (see `_clear_exhausted_notice()`).
+_ALL_EXHAUSTED_KEY = "all-exhausted"
+
 _LONG_WAIT_NOTIFY_S = 300.0  # notify the operator if an all-seats wait exceeds ~5 minutes
 _SLEEP_CHUNK_S = 30.0  # bounded sleep chunks so the loop can save state/poll telegram
 _PARK_RETRIAGE_INTERVAL_S = 60.0
@@ -473,6 +479,21 @@ def _wait_seconds(wait_until: dt.datetime | None, default_s: float = _DEFAULT_RE
     return max(_MIN_WAIT_S, min(_MAX_WAIT_S, (wait_until - now).total_seconds()))
 
 
+def _clear_exhausted_notice(config: Config, state: dict[str, Any]) -> bool:
+    """Re-arm the `all-exhausted` notification because a seat became available again. Returns True
+    if the key was actually present and cleared.
+
+    Persisting is guarded on a real change: this is called on every iteration that selects a seat
+    — the common, healthy path — and an unconditional `save_state()` there would add a disk write
+    per generation to accomplish nothing.
+    """
+    if not cooldown.was_notified(state, _ALL_EXHAUSTED_KEY):
+        return False
+    cooldown.clear_notified(state, _ALL_EXHAUSTED_KEY)
+    cooldown.save_state(config.state_path, state)
+    return True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # One iteration (triage -> [pick seat -> run -> classify])
 # ─────────────────────────────────────────────────────────────────────────────
@@ -833,11 +854,24 @@ def run(
 
                 if iteration.action is None:
                     wait_s = _wait_seconds(iteration.wait_until)
+                    # An unconditional, flushed heartbeat for every wait — NOT gated on
+                    # `_LONG_WAIT_NOTIFY_S` and NOT routed through `notify()`'s dedupe. MEASURED
+                    # 2026-07-27 (DESIGN.md §4c): a supervisor waiting out a cooldown printed
+                    # NOTHING for its entire wait, so "healthy, sleeping until 19:40Z" and "hung"
+                    # and "crashed" were indistinguishable in the logfile. The deduped notification
+                    # is the right shape for an ALERT (say it once) and the wrong shape for a
+                    # liveness signal (say it every time), so this is a separate line, deliberately.
+                    print(
+                        f"[claude-relay] no seat available for {repo}; waiting {int(wait_s)}s "
+                        f"(until {iteration.wait_until if iteration.wait_until else 'unknown'})"
+                        + (f" — {'; '.join(iteration.seat_notes)}" if iteration.seat_notes else ""),
+                        flush=True,
+                    )
                     if wait_s > _LONG_WAIT_NOTIFY_S:
                         notify.notify(
                             config,
                             state,
-                            "all-exhausted",
+                            _ALL_EXHAUSTED_KEY,
                             f"All seats exhausted or in cooldown for {repo}; "
                             f"waiting ~{int(wait_s // 60)}m (until {iteration.wait_until}).",
                         )
@@ -846,6 +880,16 @@ def run(
                         return 0
                     _sleep_and_poll(wait_s, config, state, repo, lock)
                     continue
+
+                # A seat WAS selected, so the all-exhausted condition has resolved: re-arm the
+                # notification for the next exhaustion event. `notify()` dedupes on mere key
+                # PRESENCE (`was_notified()` is a bare `in` test with no TTL), and nothing cleared
+                # this key, so before this line the highest-severity alert the supervisor can send
+                # — "I have stopped working and cannot proceed" — fired exactly ONCE per
+                # `state.json` lifetime and was silent for every later exhaustion, forever.
+                # `clear_notified_prefix()`'s own docstring describes this bug class verbatim for
+                # `park:` keys; `all-exhausted` was left with it.
+                _clear_exhausted_notice(config, state)
 
                 kind = iteration.action.kind
                 if kind == detector.CONTINUE or _is_genuine_wall_hit_rotation(kind, iteration.outcome):

@@ -1133,5 +1133,84 @@ class DoneMessageReportsTheOutcomeTests(unittest.TestCase):
         self.assertNotIn("instead of terminating", message)
 
 
+class AllExhaustedNoticeReArmTests(unittest.TestCase):
+    """`all-exhausted` must be re-armed once a seat is available again.
+
+    MEASURED defect (2026-07-27, DESIGN.md §4c). `notify()` dedupes on key PRESENCE —
+    `cooldown.was_notified()` is a bare `in` test with no TTL, and the timestamp it stores is never
+    compared against anything. Nothing cleared this key: `clear_notified` was wired for
+    `needs-login:<seat>` and `auth-exhausted:<seat>`, and `clear_notified_prefix` for `park:<repo>:`,
+    but not for `all-exhausted`. So the highest-severity alert the supervisor can raise — "I have
+    stopped working and cannot proceed" — fired exactly ONCE per `state.json` lifetime and was
+    silent for every later exhaustion event, forever.
+
+    Why no audit caught it: the bug is invisible on a first exhaustion and only manifests on a
+    SECOND one, a state no unit test and no single supervised run had ever reached. It surfaced from
+    stopping a live loop and restarting it.
+    """
+
+    def test_on_disk_key_is_pinned(self) -> None:
+        # Pinned deliberately: existing `state.json` files in the field already contain this literal
+        # key. Renaming the constant would leave those entries unmatched by the clear path and
+        # silently resurrect the permanent mute for exactly the installs that hit it once.
+        self.assertEqual(loop._ALL_EXHAUSTED_KEY, "all-exhausted")
+
+    def test_clear_removes_the_key_and_persists_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            cfg = Config(state_path=state_path)
+            state = _state()
+            cooldown.mark_notified(state, loop._ALL_EXHAUSTED_KEY)
+
+            self.assertTrue(loop._clear_exhausted_notice(cfg, state))
+
+            self.assertFalse(cooldown.was_notified(state, loop._ALL_EXHAUSTED_KEY))
+            # Persisted, not merely cleared in memory: the next process must not re-read the key.
+            reloaded = cooldown.load_state(state_path)
+            self.assertFalse(cooldown.was_notified(reloaded, loop._ALL_EXHAUSTED_KEY))
+
+    def test_clear_is_a_noop_and_writes_nothing_when_the_key_is_absent(self) -> None:
+        # The healthy path runs this on every seat-selecting iteration; it must not turn into a
+        # disk write per generation.
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            cfg = Config(state_path=state_path)
+            state = _state()
+
+            self.assertFalse(loop._clear_exhausted_notice(cfg, state))
+            self.assertFalse(state_path.exists())
+
+    def test_clear_preserves_other_notified_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(state_path=Path(tmp) / "state.json")
+            state = _state()
+            cooldown.mark_notified(state, loop._ALL_EXHAUSTED_KEY)
+            cooldown.mark_notified(state, "needs-login:/home/u/.claude-x")
+
+            loop._clear_exhausted_notice(cfg, state)
+
+            self.assertTrue(cooldown.was_notified(state, "needs-login:/home/u/.claude-x"))
+
+    def test_notification_fires_again_after_a_clear(self) -> None:
+        """The whole point, end to end: notify -> deduped -> clear -> notifies AGAIN."""
+        from relay import notify as notify_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(state_path=Path(tmp) / "state.json", notify_sink="stdout")
+            state = _state()
+
+            with mock.patch.object(notify_mod, "dispatch", return_value=True) as dispatch:
+                self.assertTrue(notify_mod.notify(cfg, state, loop._ALL_EXHAUSTED_KEY, "first"))
+                # Second exhaustion with no intervening recovery: correctly suppressed.
+                self.assertFalse(notify_mod.notify(cfg, state, loop._ALL_EXHAUSTED_KEY, "second"))
+                self.assertEqual(dispatch.call_count, 1)
+
+                loop._clear_exhausted_notice(cfg, state)  # a seat became available
+
+                self.assertTrue(notify_mod.notify(cfg, state, loop._ALL_EXHAUSTED_KEY, "third"))
+                self.assertEqual(dispatch.call_count, 2)
+                self.assertEqual(dispatch.call_args[0][1], "third")
+
+
 if __name__ == "__main__":
     unittest.main()
