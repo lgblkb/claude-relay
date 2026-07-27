@@ -197,11 +197,25 @@ class RateLimitEventTests(unittest.TestCase):
         action = detector.classify("AGENT_DEAD_NONLIMIT", usage=_usage(10.0), tail=tail)
         self.assertEqual(action.kind, detector.RETRY)
 
-    def test_known_safe_status_at_high_utilization_rotates_with_a_real_resets_at(self) -> None:
+    def test_known_safe_status_at_high_utilization_rotates_without_a_resets_at(self) -> None:
+        """EXPECTATION INVERTED 2026-07-27 by the rotation/cooldown split.
+
+        This test previously asserted `action.resets_at == "2026-07-29T02:00:00+00:00"` — i.e. that a
+        high-utilization WARNING sets the cooldown boundary to the window's reset. It was pinning the
+        bug: `loop.py`'s AGENT_DEAD_NONLIMIT branch feeds that value to `_force_cooldown()`, so on a
+        `seven_day` event this declared a still-working seat dead for DAYS.
+
+        Q1 (see relay/ratelimit_probe.py) settled it: 42 events captured from 0.90 to 0.99
+        utilization, every call succeeding. The channel warns; it never denies. So the event drives
+        rotation and the usage endpoint decides exhaustion.
+
+        Kept rather than deleted, with the old assertion quoted above, so the inversion is legible to
+        anyone who wonders why this contract changed.
+        """
         tail = [_rate_limit_line(status="allowed_warning", utilization=0.95, resets_at=1785290400)]
         action = detector.classify("AGENT_DEAD_NONLIMIT", usage=_usage(10.0), tail=tail)
         self.assertEqual(action.kind, detector.CONTINUE_ROTATE)
-        self.assertEqual(action.resets_at, "2026-07-29T02:00:00+00:00")
+        self.assertIsNone(action.resets_at)
 
     def test_rotates_even_when_the_live_usage_reading_was_healthy(self) -> None:
         """The one deliberate Invariant #2 narrowing this item adds: authoritative regardless of
@@ -678,3 +692,69 @@ class RateLimitUtilizationCalibrationTests(unittest.TestCase):
         self.assertIsNotNone(action)
         assert action is not None
         self.assertEqual(action.kind, detector.CONTINUE_ROTATE)
+
+
+class RotationCooldownSplitTests(unittest.TestCase):
+    """The rotation/cooldown split (2026-07-27).
+
+    `loop.py`'s AGENT_DEAD_NONLIMIT branch passes `action.resets_at` to `_force_cooldown()` as the
+    cooldown BOUNDARY. Q1 established that this event channel only ever WARNS — 42 events from 0.90
+    to 0.99 utilization, every call succeeding — so a high-utilization event must drive ROTATION
+    (move off this seat now) without declaring the seat dead until its window resets.
+
+    Worst case before the fix: a `seven_day` event at 0.90 cooled the seat for DAYS, discarding ~10%
+    of still-spendable weekly quota, on the strength of a warning about a seat that was
+    demonstrably still serving requests.
+    """
+
+    @staticmethod
+    def _tail(**info: object) -> list[str]:
+        base: dict[str, object] = {"rateLimitType": "five_hour", "resetsAt": 1785105000}
+        base.update(info)
+        return [json.dumps({"type": "rate_limit_event", "rate_limit_info": base})]
+
+    def test_a_high_utilization_warning_rotates_without_a_cooldown_horizon(self) -> None:
+        action = detector._rate_limit_event_action(self._tail(status="allowed_warning", utilization=0.95))
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action.kind, detector.CONTINUE_ROTATE)
+        self.assertIsNone(action.resets_at, "a warning must not set the cooldown boundary")
+
+    def test_a_weekly_warning_never_yields_a_multi_day_cooldown(self) -> None:
+        """The specific harm the split exists to prevent."""
+        tail = self._tail(
+            status="allowed_warning",
+            rateLimitType="seven_day",
+            utilization=0.9,
+            resetsAt=1785290400,
+        )
+        action = detector._rate_limit_event_action(tail)
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertIsNone(action.resets_at)
+
+    def test_an_unrecognized_status_still_carries_its_reset_time(self) -> None:
+        """The one case where a genuine denial remains possible keeps the conservative behaviour."""
+        action = detector._rate_limit_event_action(self._tail(status="rejected"))
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action.kind, detector.CONTINUE_ROTATE)
+        self.assertIsNotNone(action.resets_at, "an unvouched-for status must keep its reset horizon")
+
+    def test_the_reason_string_says_why_no_horizon_was_attached(self) -> None:
+        """An operator reading the log must be able to tell this apart from a missing resetsAt."""
+        action = detector._rate_limit_event_action(self._tail(status="allowed_warning", utilization=0.99))
+        assert action is not None
+        self.assertIn("WARNING", action.reason)
+
+    def test_rotation_still_happens_so_the_seat_is_not_hammered(self) -> None:
+        """Dropping the horizon must not drop the rotation — `_force_cooldown()` still applies its
+        short default guess, which is what stops `pick_seat()` re-selecting this seat immediately.
+        """
+        for util in (0.9, 0.95, 0.99):
+            with self.subTest(utilization=util):
+                tail = self._tail(status="allowed_warning", utilization=util)
+                action = detector._rate_limit_event_action(tail)
+                self.assertIsNotNone(action)
+                assert action is not None
+                self.assertEqual(action.kind, detector.CONTINUE_ROTATE)

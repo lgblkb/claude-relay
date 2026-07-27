@@ -465,12 +465,37 @@ def _rate_limit_event_action(tail: list[str]) -> Action | None:
             resets_at=resets_at,
         )
     if signal.utilization is not None and signal.utilization >= _RATE_LIMIT_UTILIZATION_ROTATE_THRESHOLD:
+        # DELIBERATELY NO `resets_at` HERE — this is the rotation/cooldown split (2026-07-27).
+        #
+        # `loop.py`'s AGENT_DEAD_NONLIMIT branch is this Action's only consumer, and it passes
+        # `action.resets_at` to `_force_cooldown()` as the cooldown BOUNDARY. Supplying it from a
+        # high-utilization event marks the seat unusable until its window resets — which is
+        # indefensible for this branch, because Q1 established that this channel only ever WARNS:
+        # 42 events were captured from 0.90 to 0.99 utilization and every single call succeeded.
+        # A warning is not a denial.
+        #
+        # The damage was worst on the weekly window: a `seven_day` event at 0.90 would have cooled
+        # the seat for DAYS, discarding ~10% of still-spendable weekly quota, on the strength of a
+        # warning about a seat that was demonstrably still serving requests. That was the standing
+        # prediction recorded in relay/ratelimit_probe.py; Q1 converted it from a suspicion into a
+        # straightforward consequence, so it is fixed here on the reasoning rather than waiting for
+        # the `seven_day`-at-0.90 observation to arrive.
+        #
+        # Omitting `resets_at` does NOT weaken rotation. `_force_cooldown()` falls back to the short
+        # `_TIMEOUT_COOLDOWN_S` guess, which is exactly what that branch needs: enough for
+        # `pick_seat()` to move off this seat next iteration without declaring it dead for hours.
+        # The seat's REAL exhaustion is decided by the usage endpoint — `severity: "critical"` at
+        # `percent: 100`, verified against a genuinely walled seat — which is Invariant #2's primary
+        # path and already records a proper cooldown via `_record_usage()`.
+        #
+        # The unrecognized-status branch above KEEPS `resets_at`, because a status this module
+        # cannot vouch for is the one case where a genuine denial remains possible.
         return Action(
             CONTINUE_ROTATE,
             f"rate_limit_event: utilization {signal.utilization:.0%} of the "
             f"{signal.rate_limit_type or '?'} window at/above the rotate threshold "
-            f"({_RATE_LIMIT_UTILIZATION_ROTATE_THRESHOLD:.0%})",
-            resets_at=resets_at,
+            f"({_RATE_LIMIT_UTILIZATION_ROTATE_THRESHOLD:.0%}) — rotating on a WARNING, so no "
+            "event-derived cooldown horizon is attached (see the comment above)",
         )
     return None
 
