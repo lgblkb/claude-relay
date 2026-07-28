@@ -185,6 +185,13 @@ Phase 2 because it needs sound per-unit cost calibration, which v1 does not have
   that matters for the model's *shape*: cache reads are 98.6% of tokens but output tokens are the
   majority of the bill, so a model keyed on token count rather than token kind is wrong by an order
   of magnitude.
+  **Second datapoint (2026-07-27, §4c):** a *bugfix* generation measured **$7.84 / 4 points of
+  `seven_day`** (12 agents, 34.1 min) — roughly half a greenfield generation, so the per-seat-week
+  budget is ~4 greenfield **or ~8 bugfix** units. Generation cost is therefore not a single constant
+  and Phase 2 batching should not treat it as one; scope is the dominant term. A caution for any
+  percent-based estimator: `five_hour` was observed going **53% → 48% while actively spending**,
+  because the window rolled mid-run — across a roll the delta is not merely noisy, it is negative.
+  `modelUsage` and `seven_day` are the trustworthy channels.
   **Collection now exists (2026-07-27):** `relay/capture.py` is an opt-in passive tap
   (`CLAUDE_RELAY_CAPTURE_DIR`) that records every terminal `result` envelope — `modelUsage`
   included — from normal runs, at ~zero marginal cost, because `runner.py` already reads every
@@ -527,6 +534,146 @@ them needs a second seat in the pool, and the only candidate (`azim`) holds ~13 
 one generation's worth. That is a real spend for a real answer and should be a deliberate decision,
 not a side effect.
 
+**Resolved by §4c (2026-07-27, `live-run-02`).** The premise above was wrong in a useful way: rotation
+*selection* costs nothing to test. `--dry-run` combined with `--ceiling SEATNAME=PCT` moves the
+threshold instead of waiting for real usage, so three of the four open questions were answerable for
+zero tokens. Only the generation itself needed a real spend.
+
+### 4c. Rotation, cooldown recovery, and a second cost point (2026-07-27, `live-run-02`)
+
+#### Setup
+
+The operator's interactive session moved from the `azim` seat to the bare `~/.claude` login
+(`dias@`, a third account in the same org). This is isolation *by construction*, not by
+configuration: `discover_seats()` globs `.claude-*`, so bare `~/.claude` can never be pooled
+(`fleet.py`). It also freed `azim` to rejoin the pool, which rotation requires — `ayan` and `azim`
+are the only seats that exist. `claude-relay init`/`adopt` are the one pair of commands that would
+undo this, by converting `~/.claude` into a seat.
+
+#### Rotation selection — validated at zero token cost
+
+Four `--dry-run` probes, predictions registered before running:
+
+| probe | ceilings | result |
+|---|---|---|
+| baseline | defaults | `seat: azim`, `seat_notes: ["in-cooldown: ayan"]`, `seat_percent: 51.0` |
+| P3 | `azim=30` | `seat: null` — `in-cooldown: ayan`, `rotate-off: azim (ceiling=30.0%)` |
+| P4 | `ayan=95` | ayan **still blocked**, azim selected |
+| P5 | `ayan=95 azim=30` | `seat: null` |
+
+P4 is the operationally load-bearing one: a persisted `cooldownUntil` is checked on a different path
+(`in-cooldown`) than the ceiling (`rotate-off`), and it wins. **`--ceiling` cannot return a cooling
+seat to service** — worth knowing before reaching for it during an incident expecting otherwise.
+
+The baseline probe first returned `plan_kind: DONE` (backlog exhausted), which established an
+ordering the loop's structure implies but no test had shown: **the supervisor decides *what* to do
+before *who* does it**, so an empty backlog short-circuits ahead of seat selection entirely.
+
+#### Cooldown recovery
+
+Observed end to end, and free — the wait costs usage polls, not tokens:
+
+```
+19:01Z  [claude-relay] no seat available ...; waiting 2310s
+        (until 2026-07-27 19:40:00Z) — in-cooldown: ayan; in-cooldown: azim
+19:40Z  wake, re-poll, select azim
+19:40:10Z  spawn
+```
+
+`_earliest_wait()` chose the minimum of azim's `lastResetsAt` (19:40Z) and ayan's `cooldownUntil`
+(21:40Z), correctly. Note this wait was **self-inflicted**: the `--ceiling 1` probes above wrote a
+durable `cooldownUntil` for azim (see F5), so a diagnostic override delayed a real run by 39 minutes.
+
+#### Second cost datapoint
+
+| | `live-run-01` (G0, greenfield) | `live-run-02` (G1, bugfix) |
+|---|---|---|
+| agents | 17 | 12 |
+| wall clock | 63.8 min | 34.1 min |
+| direct cost | $14.73 | $7.84 |
+| weekly points | 9 | 4 (azim 84 → 88) |
+| gate | GREEN | GREEN (55 tests, 97.55%) |
+
+**A bugfix generation costs roughly half a greenfield one**: ~8 bugfix or ~4 greenfield generations
+per seat-week. G1 also corrected §4b finding #7's metric, verified against the real 49-call corpus at
+`98.59%` (hand-checked: `36,386,046 / (5,088 + 515,137 + 36,386,046)`), where the old formula printed
+a flat `100.0%`.
+
+`five_hour` read 53% → 48% *while actively spending*, because the window rolled mid-run. Percent
+deltas across a window roll remain meaningless (feasibility #3), now observed directly rather than
+inferred; `modelUsage` and the weekly gauge are the trustworthy channels.
+
+#### Findings
+
+1. **(HIGH) `all-exhausted` was muted forever.** `notify()` dedupes on key *presence* —
+   `was_notified()` is a bare `in` test with no TTL, and the timestamp it stores is never compared to
+   anything. Nothing cleared this key, though `clear_notified` is wired for `needs-login:<seat>` and
+   `auth-exhausted:<seat>`, and `clear_notified_prefix` for `park:<repo>:`. The highest-severity alert
+   the supervisor can raise fired **exactly once per `state.json` lifetime**, then never again.
+   `clear_notified_prefix()`'s own docstring describes this bug class verbatim — the audit that wrote
+   it fixed `park:` and left `all-exhausted`. Invisible on a first exhaustion; only manifests on a
+   second, which no unit test and no single run had ever reached.
+2. **(MED-HIGH) No console sink flushed.** The unattended deployment redirects stdout to a file, where
+   Python block-buffers at ~8KB instead of line-buffering. A live notification was dispatched (proved
+   by its key landing in `lastNotified`, which only happens on a True return) into a logfile that
+   stayed 0 bytes, and `SIGTERM` discarded the buffer. Compounding: `notify()` marks a key notified on
+   that return, so state claimed the operator was told about a message that never reached disk.
+3. **(MED) The loop printed nothing while waiting**, making healthy sleep, hang, and silent crash
+   indistinguishable. Fixed with a flushed heartbeat per wait, deliberately *not* routed through
+   `notify()`'s dedupe: dedupe is right for an alert, wrong for a liveness signal. `live-run-02`
+   demonstrated exactly why — a stale key suppressed the alert while the heartbeat still reported.
+4. **(MED) `enable <seat>` claimed an effect it could not deliver.** For a config-excluded seat that
+   plainly existed it printed both "was already enabled" and "no seat named 'azim' discovered yet".
+   Two causes: the probe passed `effective_exclude()` into `discover_seats()`, so excluded seats read
+   as nonexistent — and an excluded seat is exactly what `enable` is for; and `disabledSeats` versus
+   config `exclude`/`main` are independent gates of which `enable` clears only one.
+5. **(LOW-MED) `--ceiling` mutates persistent state.** A synthetic override writes a real
+   `cooldownUntil`, which then blocks subsequent *normal* runs. Demonstrated by delaying this run 39
+   minutes. A diagnostic flag should not leave durable state behind.
+6. **(LOW) `--dry-run` with `seat: null` never reports when a seat becomes available**, though
+   `_earliest_wait()` knows. The heartbeat now covers the `run` path; dry-run still does not.
+7. **(MED) `severity` does not exist in the usage API.** Not null — absent. The response carries
+   `utilization`, `resets_at`, and `limit_dollars`/`used_dollars`/`remaining_dollars` (all `None` on
+   this plan; the per-model buckets `seven_day_opus`/`seven_day_sonnet`/… are `None` too). Since
+   `usage.py:121` defaults it to `"normal"`, the documented rotation condition `severity != "normal"`
+   (`usage.py:19`) is **permanently dead**, and both `detector.py:487` and `ratelimit_probe.py:49`
+   describe it as "the authoritative wall signal". Rotation rests entirely on `utilization`, which
+   works — but the second signal the design believes in never arrives. Unverified: whether the field
+   appears near the cap; absence is confirmed only at 48% five-hour / 88% weekly.
+8. **(INFO) The warning signal exists in the other vocabulary.** The NDJSON `rate_limit_event` stream
+   reported `status=allowed_warning` continuously at 0.83–0.88 for the same condition where the usage
+   endpoint carries no severity field at all. The two vocabularies disagree about which field warns.
+
+#### The fix that did not work, and why it passed its tests
+
+The F1 fix shipped in a state where it **could never execute**. It was placed beside the action
+handling, which sits *below* the `max_units` gate; that gate returns as soon as a unit is counted, so
+with `max_units = 1` the clear was unreachable. `live-run-02` completed a generation, exited cleanly,
+and left `all-exhausted` set — the registered prediction said the key would be gone.
+
+All five of its unit tests passed throughout, because every one called `_clear_exhausted_notice()`
+**directly**. They verified the helper clears, persists, no-ops when absent, and preserves other keys —
+each correct, and not one of them established that production control flow reaches the call site.
+
+This is the same failure mode §4b finding #7 documents, reproduced one merge later in the fix written
+*in response to it*: artifacts that agree with each other, checked against nothing that runs. The
+correction moves the clear above every termination gate, gates it on `iteration.seat` (literally the
+condition whose resolution re-arms the alert), and adds tests that drive the real `loop.run()` —
+verified to fail against the previous placement.
+
+**Standing rule this earns:** a test that exercises a helper in isolation does not establish that the
+helper is called. When a fix consists of adding a call, the regression test must drive the entry point,
+not the callee.
+
+#### Still untested after this run
+
+- **Multi-unit crawling** (`max_units > 1`): every run so far has stopped after one unit, so the
+  loop's second iteration — and the `all-exhausted` re-arm now placed on it — has never run live.
+- **A genuine wall hit.** Both runs finished under their ceilings; `HIT_WALL` classification, forced
+  cooldown, and mid-generation rotation to a second seat remain untouched by execution.
+- **Telegram notify/resolve.** No credentials on this box; `stdout` is the only sink ever exercised.
+- **Whether `severity` ever appears** near the cap (finding 7).
+
 ## 5. gad-kit brain: triage, outcome & the recovery-routing fix (`gadkit.py`)
 
 **Feasibility Critical finding:** `AGENT-DEAD` writes NOTHING to disk (the failed
@@ -670,6 +817,11 @@ Recovery never destroys unrelated user work (Invariant #6).
   gate GREEN, 19/19 criteria, on one `--once` invocation. Loop, config, cooldown-from-real-
   `resets_at`, `max_units` enforcement and the notifier are no longer unit-test-only. Rotation
   and cooldown *recovery* remain untested (a single invocation never rotates).
+  **Executed 2026-07-27 (§4c): rotation selection and cooldown recovery ANSWERED.** Seat selection,
+  skip-on-cooldown, rotate-off-on-ceiling and the empty-pool path were validated at **zero token
+  cost** (`--dry-run` + `--ceiling`); recovery was observed end to end (2310s wait → wake at the
+  computed `19:40:00Z` → select → spawn at 19:40:10Z). Still untested: multi-unit crawling
+  (`max_units > 1`), a genuine wall hit with mid-generation rotation, and the Telegram sinks.
 - **Phase 2:** tmux monitor ✅ (observe-only: `monitor`/`seats`, live+fallback table) +
   standalone OAuth refresh (→ *idle*-seat truly-live table; still deferred) + calibrated
   `--max N` batching (stream-json token cost; still deferred).

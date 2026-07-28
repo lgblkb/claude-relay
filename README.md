@@ -337,15 +337,20 @@ bug in `_force_cooldown()`, recorded so the data can refute it rather than be ra
 
 ## What one generation actually costs
 
-Measured on the first real supervised run (2026-07-27, full writeup in DESIGN.md §4b): **one
-committed gad-kit generation**, 17 agents, 63.8 minutes, gate GREEN, 19/19 acceptance criteria.
+Measured on two real supervised runs (2026-07-27; full writeups in DESIGN.md §4b and §4c), both
+ending in a committed generation with a green gate:
 
-| | |
-|---|---|
-| dollars | **$14.73** |
-| `five_hour` points | **90** |
-| `seven_day` points | **9** |
-| per seat per week | **~4 generations** (95-point weekly ceiling) |
+| | greenfield build | bugfix |
+|---|---|---|
+| agents | 17 | 12 |
+| wall clock | 63.8 min | 34.1 min |
+| dollars | **$14.73** | **$7.84** |
+| `five_hour` points | **90** | — (window rolled mid-run) |
+| `seven_day` points | **9** | **4** |
+| per seat per week | **~4 generations** | **~8 generations** |
+
+**Scope dominates.** A bugfix generation costs about half a greenfield one, so "cost per generation"
+is a range, not a constant — budget by what the generation actually asks for.
 
 Three things follow that are easy to get wrong:
 
