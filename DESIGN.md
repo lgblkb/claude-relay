@@ -745,6 +745,48 @@ per-turn budget. It is kept (harmless either way, and a future CLI version may w
 but must not be relied on; `--max 1` is what actually bounds each `claude-relay`-launched
 invocation.
 
+**tokenAllowance — the soft usage ceiling (2026-07-30).** `--max 1` bounds a launch to ONE
+generation, which is a unit of work, not a unit of quota: a single generation can consume a whole
+five-hour window (observed: a seat with a 70% synthetic ceiling finishing a run at 97%, because
+`ceiling_pct` only gates which seat to START on). `command()` therefore also threads a
+**`tokenAllowance` workflow arg** — an OUTPUT-TOKEN count, sized by `Config.launch_budget_for()`
+from the seat's headroom below its ceiling — into all three modes. gad-kit compares
+`budget.spent()` against it at phase and verify-loop boundaries and stops itself with
+`RESULT: PAUSED` rather than killing a running subagent; `detector.classify()` maps that to a
+healthy rotate and sets `Action.paused`, on which `run_once()` cools the seat and `loop.run()`
+spares the HARD_ERROR breaker (several seats pausing in a row is the expected steady state near a
+fleet-wide ceiling, not a crash loop). `BUDGET-EXHAUSTED` — gad-run's "cannot afford to start the
+next generation" exit, dead code until this landed because its gate read the null `budget.total` —
+is classified the same way, for the same reason.
+
+**Two halves, both required.** The in-flight pause only fires at a gate gad-kit actually reaches,
+and its pre-Verify gates default OFF for resume safety (a pre-Verify pause writes no
+`reviews/verification.md`, so the artifact census reads "nothing happened" and `triage()` stashes
+the tree and restarts from Preflight — with nothing ever popping that stash). A generation whose
+Verify is clean on the first iteration therefore never consults the allowance at all. What bounds
+THAT run is the launch gate: `pick_seat()` skips any seat whose headroom is worth less than
+`min_token_target`, whose default is gad-kit's own `phaseTokens` summed over a clean generation
+(matching gad-kit's own `perGenTokens` default, and RAISED to the worst of the last three real
+generations x1.15 wherever `.gad/perf-history.jsonl` supplies them) — read it as **"only start a seat
+that can afford a whole generation."** The pause covers the
+tail the launch gate cannot predict: a verify loop that keeps finding work. `_validate()` rejects an
+arithmetically unsatisfiable config (best case under the highest ceiling still below the floor),
+since that would idle the pool permanently and unrecoverably — an unlaunched seat never writes a
+calibration record, so it can never learn its way out.
+
+It is an ARG, not the directive above, for exactly the reason the B22 note gives: `budget.total` is
+dead, so `budget.remaining()` cannot gate anything. `budget.spent()` is the one member that works —
+and it counts output tokens across the whole `claude` PROCESS from a baseline that is never
+advanced, which is precisely why a flat per-launch allowance is correct even for gad-run's
+multi-generation crawl: parent and children share the one counter and draw down one pool.
+
+The conversion rate (`tokens_per_percent`) is MEASURED, not configured: gad-run writes its true
+`budget.spent()` to `.gad/perf-history.jsonl` — its OWN pre-existing cost ledger, not a
+relay-specific file — and `loop._learn_tokens_per_percent()` divides it by
+the seat's observed percent delta for the same run, then folds the result into a per-seat learned
+rate held in state. A disk fact, not model prose — Invariant #2 holds. Off by default
+(`derive_token_target = false`): with it off no allowance arg is passed and every gate is inert.
+
 **snapshot / outcome:** snapshot = `{HEAD, nextGen, artifact fingerprint}`. outcome()
 classifies from pre/post disk + post-run usage into a **richer set** (feasibility #5):
 `PROGRESSED` (new `gen-N` commit) · `HIT_WALL` (no new commit AND active `percent`≈100 /
@@ -803,7 +845,13 @@ token_target = "+2M"             # directive appended to run prompt — VERIFIED
                                   # installed CLI never populates budget.total; kept, not relied on
 max_units  = 0                    # 0 = until DONE
 [defaults] ceiling_pct = 70; start_margin = 5    # synthetic 5h ceiling for all pool seats
+[defaults] derive_token_target = false            # soft usage ceiling — OFF until tokens_per_percent
+           tokens_per_percent = 1200              # is LEARNED per seat (see §5 tokenAllowance);
+           headroom_safety_pct = 5                # aim below the ceiling, overshoot is the bad way
+           min_token_target = 200000              # FLOOR for "a generation"; the PRIMARY gate.
+                                                  # perf-history.jsonl raises it to measured cost
 [seats.almas] ceiling_pct = 70                    # per-seat override; --ceiling to override at runtime
+[seats.sam]   tokens_per_percent = 30000          # pin a known tier, overriding what was learned
 [seats.dias]  main = true                         # reserved: excluded from automation
 [gadkit] tier = "budget"; extra_flags = []
 [telegram] bot_token = "env:CLAUDE_RELAY_TELEGRAM_BOT_TOKEN"; chat_id = "…"  # or inline (chmod 600)

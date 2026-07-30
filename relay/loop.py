@@ -32,6 +32,10 @@ _MAX_CONSECUTIVE_AGENT_DEAD = 3
 # both the notify site and the clear site below, because the bug this fixes was born of a bare
 # string literal that existed at exactly one of those two places (see `_clear_exhausted_notice()`).
 _ALL_EXHAUSTED_KEY = "all-exhausted"
+# Distinct from the key above because the two conditions call for opposite operator responses: an
+# exhausted pool needs patience, a below-the-floor pool needs a config change and will never recover
+# on its own. Sharing one dedupe key would also let whichever fired first silence the other.
+_BELOW_FLOOR_KEY = "all-below-token-floor"
 
 _LONG_WAIT_NOTIFY_S = 300.0  # notify the operator if an all-seats wait exceeds ~5 minutes
 _SLEEP_CHUNK_S = 30.0  # bounded sleep chunks so the loop can save state/poll telegram
@@ -319,6 +323,8 @@ def pick_seat(
     config: Config,
     *,
     dry_run: bool = False,
+    required_tokens: int | None = None,
+    required_why: str = "",
 ) -> tuple[fleet.Seat | None, usage_mod.UsageSnapshot | None, list[str]]:
     """Among usable, not-in-cooldown seats, prefer the lowest active-session `percent` with
     `percent < ceiling_pct(seat) - start_margin`; if none qualifies, return (None, None, notes)
@@ -381,10 +387,30 @@ def pick_seat(
             continue
         percent = usage_mod.session_percent(seat_usage)
         start_cap = ceiling - config.start_margin
-        if percent < start_cap:
-            candidates.append((seat, seat_usage))
-        else:
+        if percent >= start_cap:
             notes.append(f"above-start-cap: {seat.name} ({percent}% >= {start_cap}%)")
+            continue
+        # The soft usage ceiling's LAUNCH GATE (2026-07-30). `start_margin` asks the coarse
+        # question "is this seat far enough below its ceiling to bother starting?"; this asks the
+        # quantitative one, "does the headroom that is left convert to enough output tokens to fund
+        # a phase?" — and a seat that fails it must be SKIPPED, not started with a tiny allowance.
+        # Starting it anyway is the livelock `Config.launch_budget_for()` documents: gad-kit pauses
+        # before its first gated phase, relay rotates, the next seat does the same, and the pool
+        # burns one launch per seat forever while committing nothing.
+        #
+        # Inert unless `derive_token_target` is on, in which case `startable` is always True and
+        # this is a no-op — the selection order and outcome are bit-for-bit unchanged.
+        launch_budget = config.launch_budget_for(
+            seat.name,
+            percent,
+            learned=cooldown.learned_tokens_per_percent(state, seat.path),
+            required_tokens=required_tokens,
+            required_why=required_why,
+        )
+        if not launch_budget.startable:
+            notes.append(f"below-token-floor: {seat.name}: {launch_budget.reason}")
+            continue
+        candidates.append((seat, seat_usage))
 
     if not candidates:
         # Last resort: nothing has a live reading, so offer a 401 seat purely so the next `claude`
@@ -581,7 +607,13 @@ def run_once(
 
     seats = fleet.discover_seats(config.effective_exclude())
     sync_seat_login_state(state, seats)
-    seat, _seat_usage, notes = pick_seat(seats, state, cache, config)
+    # What a generation costs ON THIS REPO — measured from `.gad/perf-history.jsonl` where enough
+    # history exists, otherwise the configured floor. Computed once here and used for BOTH the seat
+    # gate and the launch decision below, so the two cannot disagree within one iteration.
+    required_tokens, required_why = gadkit.adaptive_generation_cost(repo, config.min_token_target)
+    seat, _seat_usage, notes = pick_seat(
+        seats, state, cache, config, required_tokens=required_tokens, required_why=required_why
+    )
     if seat is None:
         # `triage()` must book a research repo's one-per-HEAD backlog-refill attempt at decision
         # time (it is the only place holding `state`), but nothing was spent here — every seat is
@@ -602,7 +634,46 @@ def run_once(
             plan=plan, action=None, seat_notes=notes, wait_until=_earliest_wait(seats, state)
         )
 
+    # Size this launch's output-token allowance to the seat we are actually about to use, and hand
+    # it to the plan. This is the single line that makes the soft usage ceiling real: `triage()`
+    # built `plan` before any seat was chosen, so its allowance is necessarily None until here —
+    # `gadkit.command()` then threads a non-None value through as the `tokenAllowance` workflow arg,
+    # which is what gad-kit's `shouldPause()` compares `budget.spent()` against.
+    #
+    # `pick_seat()` already refused any seat whose budget was not `startable`, so a non-startable
+    # answer at this point would be an internal inconsistency (the only way to reach it is a seat
+    # offered by the last-resort 401 path, which carries `usage=None` and therefore always resolves
+    # to the unbounded-but-startable case). Handled defensively rather than trusted: rotate the seat
+    # away and take the wait path, never launch with a budget we just judged unfundable.
+    seat_percent = None if _seat_usage is None else usage_mod.session_percent(_seat_usage)
+    launch_budget = config.launch_budget_for(
+        seat.name,
+        seat_percent,
+        learned=cooldown.learned_tokens_per_percent(state, seat.path),
+        required_tokens=required_tokens,
+        required_why=required_why,
+    )
+    if not launch_budget.startable:
+        _force_cooldown(state, seat)
+        notes.append(f"below-token-floor at launch: {seat.name}: {launch_budget.reason}")
+        return IterationResult(
+            plan=plan, action=None, seat_notes=notes, wait_until=_earliest_wait(seats, state)
+        )
+    if launch_budget.allowance is not None:
+        plan = dataclasses.replace(
+            plan,
+            token_allowance=launch_budget.allowance,
+            # Keep the prompt's human-readable budget sentence consistent with what is enforced.
+            token_target=f"+{launch_budget.allowance}",
+        )
+        print(
+            f"[claude-relay] seat={seat.name} tokenAllowance={launch_budget.allowance} "
+            f"({launch_budget.reason})",
+            flush=True,
+        )
+
     pre = gadkit.snapshot(repo)
+    perf_records_before = len(gadkit.read_perf_history(repo))
     argv = gadkit.command(plan)
     plugin_dirs = [str(p) for p in plugins.resolve_plugin_dirs(config.plugin_dirs)]
     result = runner.run(
@@ -653,8 +724,114 @@ def run_once(
         # CONTINUE_ROTATE; `_force_cooldown()` prefers it over the blind timeout guess.
         _force_cooldown(state, seat, resets_at=action.resets_at)
 
+    if action.paused:
+        # gad-kit's soft ceiling fired: it spent its whole allowance and stopped itself at a unit
+        # boundary. That allowance WAS this seat's headroom below its ceiling, so the seat is now
+        # done for this window by construction — and, unlike a wall-hit, its raw percent may still
+        # look startable (the ceiling is synthetic and sits well below 100%). Nothing in the normal
+        # path would cool it: `_record_usage()`/`rotate_off()` only fire at the real ceiling, and
+        # the AGENT_DEAD_NONLIMIT branch above does not cover the PROGRESSED flavour of a pause.
+        # Left uncooled, the very next iteration re-selects the same seat, whose fresh allowance is
+        # now near zero, and it pauses again at the same gate — a launch spent per iteration.
+        #
+        # Cool it to the seat's OWN reported reset time when we have one; that is when its headroom
+        # genuinely returns, and it is a real platform figure rather than a guess.
+        resets_at = None
+        if post_usage is not None:
+            reset_dt = usage_mod.session_resets_at(post_usage)
+            if reset_dt is not None:
+                resets_at = reset_dt.isoformat()
+        _force_cooldown(state, seat, resets_at=resets_at)
+        _learn_tokens_per_percent(state, seat, repo, perf_records_before, _seat_usage, post_usage)
+    elif outcome_bucket == "PROGRESSED":
+        # A completed, committed run is also a valid calibration sample — in fact the best kind,
+        # since it spans a whole generation rather than a truncated one.
+        _learn_tokens_per_percent(state, seat, repo, perf_records_before, _seat_usage, post_usage)
+
     return IterationResult(
         plan=plan, action=action, seat=seat, run_result=result, outcome=outcome_bucket, seat_notes=notes
+    )
+
+
+# How much of a new observation to fold into a seat's learned tokens-per-percent. Low on purpose:
+# individual runs are noisy (a generation that stalled on one long agent burns wall-clock window
+# with little output; a wide fan-out burns output with little wall-clock), and the number this feeds
+# decides whether seats are startable at all — so it must drift toward the truth over several runs
+# rather than lurch to whatever the last one happened to look like.
+_TOKENS_PER_PCT_EWMA_ALPHA = 0.3
+# Reject observations outside this band as measurement error rather than learning from them. The
+# span is deliberately wide (three orders of magnitude): its job is to catch a nonsense pairing —
+# a percent delta of ~0 with real spend, a stale perf-history record, two seats' runs interleaved —
+# not to encode an opinion about what a plausible rate is, which is the very thing being measured.
+_TOKENS_PER_PCT_MIN = 50.0
+_TOKENS_PER_PCT_MAX = 50_000.0
+# A percent delta below this is treated as unmeasurable: the usage gauge is coarse, so dividing real
+# spend by a delta of 0.2% manufactures a rate ten times too large from pure quantization noise.
+_MIN_LEARNABLE_PCT_DELTA = 2.0
+
+
+def _learn_tokens_per_percent(
+    state: dict[str, Any],
+    seat: fleet.Seat,
+    repo: Path,
+    perf_records_before: int,
+    pre_usage: usage_mod.UsageSnapshot | None,
+    post_usage: usage_mod.UsageSnapshot | None,
+) -> None:
+    """Fold this run into `seat`'s learned output-tokens-per-percent, if it is measurable.
+
+    Pairs the two halves of an observation neither side can make alone: how many OUTPUT TOKENS the
+    run spent (only gad-kit knows — it reads `budget.spent()` from inside the workflow and its
+    consolidator appends the total to `.gad/perf-history.jsonl`) against how much of the five-hour
+    WINDOW that consumed (only relay knows, from its own pre/post usage polls of this seat).
+
+    Silently does nothing whenever the observation is not trustworthy — a missing or stale record, an
+    unreadable usage poll, a percent delta too small to divide by, or a resulting rate outside
+    `_TOKENS_PER_PCT_MIN.._MAX`. Calibration is advisory: a run that teaches us nothing is normal and
+    must never be an error, and a bad sample is far worse than no sample, because too LOW a learned
+    rate makes the seat unstartable.
+
+    Tail-only and ideation records are deliberately NOT filtered out here, unlike in
+    `gadkit.adaptive_generation_cost()`: they cost less in absolute terms, but their percent delta
+    shrinks with their token count, so the RATIO they yield is still a valid sample. See
+    `gadkit.PerfRecord` for the one bias that does survive (consolidate's own tokens are missing from
+    every record, so every rate learned here is a lower bound).
+    """
+    records = gadkit.read_perf_history(repo)
+    if len(records) <= perf_records_before:
+        return  # nothing new — only records earlier launches left behind
+    record = records[-1]
+    if pre_usage is None or post_usage is None:
+        return
+    pct_delta = usage_mod.session_percent(post_usage) - usage_mod.session_percent(pre_usage)
+    if pct_delta < _MIN_LEARNABLE_PCT_DELTA:
+        # Also catches the negative case: the window reset mid-run, so post is a fresh window and
+        # the delta is meaningless rather than merely small.
+        return
+    observed = record.tokens / pct_delta
+    if not (_TOKENS_PER_PCT_MIN <= observed <= _TOKENS_PER_PCT_MAX):
+        print(
+            f"[claude-relay] seat={seat.name} discarding an implausible calibration sample "
+            f"({record.tokens} output tokens / {pct_delta:.1f}% = "
+            f"{observed:.0f}/pct, outside {_TOKENS_PER_PCT_MIN:.0f}..{_TOKENS_PER_PCT_MAX:.0f})",
+            flush=True,
+        )
+        return
+    previous = cooldown.learned_tokens_per_percent(state, seat.path)
+    blended = (
+        observed
+        if previous is None
+        else (1 - _TOKENS_PER_PCT_EWMA_ALPHA) * previous + _TOKENS_PER_PCT_EWMA_ALPHA * observed
+    )
+    cooldown.update_seat(state, seat.path, tokens_per_percent=blended)
+    print(
+        f"[claude-relay] seat={seat.name} tokens-per-pct observed={observed:.0f} "
+        f"(gen {record.gen} cost {record.tokens} over {pct_delta:.1f}%, type={record.gen_type!r}, "
+        f"outcome={record.outcome!r}"
+        + (", tail-only" if record.resumed_by_finish else "")
+        + f") learned={blended:.0f}"
+        + ("" if previous is None else f" (was {previous:.0f})"),
+        flush=True,
     )
 
 
@@ -941,7 +1118,33 @@ def run(
                         + (f" — {'; '.join(iteration.seat_notes)}" if iteration.seat_notes else ""),
                         flush=True,
                     )
-                    if wait_s > _LONG_WAIT_NOTIFY_S:
+                    # A pool idle because every seat is BELOW THE TOKEN FLOOR is a configuration
+                    # fault dressed up as ordinary exhaustion, and it does not heal by waiting: when
+                    # the windows reset, the seats come back at 0% and are measured against the same
+                    # `tokens_per_percent`, so they are below the floor again. Worse, a seat that
+                    # never launches never writes a calibration record, so it can never learn the
+                    # better rate that would make it startable. `_validate()` rejects the case that
+                    # is arithmetically impossible for ANY seat; this catches what only shows up
+                    # against live readings, and it says the actual diagnosis instead of letting
+                    # "all seats exhausted or in cooldown" imply the pool is merely busy.
+                    below_floor = [
+                        n for n in iteration.seat_notes if n.startswith("below-token-floor")
+                    ]
+                    if below_floor:
+                        notify.notify(
+                            config,
+                            state,
+                            _BELOW_FLOOR_KEY,
+                            f"No seat for {repo} can fund a generation under its usage ceiling — "
+                            f"{len(below_floor)} seat(s) skipped by the min_token_target floor. "
+                            "This will NOT clear on its own when the windows reset. Either the "
+                            "learned tokens_per_percent is too low for these accounts, or "
+                            "min_token_target is too high. Set derive_token_target = false to run "
+                            "unbounded again while you recalibrate. "
+                            + "; ".join(below_floor),
+                        )
+                        cooldown.save_state(config.state_path, state)
+                    elif wait_s > _LONG_WAIT_NOTIFY_S:
                         notify.notify(
                             config,
                             state,
@@ -956,7 +1159,19 @@ def run(
                     continue
 
                 kind = iteration.action.kind
-                if kind == detector.CONTINUE or _is_genuine_wall_hit_rotation(kind, iteration.outcome):
+                if (
+                    kind == detector.CONTINUE
+                    or _is_genuine_wall_hit_rotation(kind, iteration.outcome)
+                    # A soft-ceiling pause must NOT count toward the HARD_ERROR breaker. It is the
+                    # mechanism working exactly as designed — the generation stopped itself at a
+                    # unit boundary with its artifacts on disk and is resumable — and `run_once()`
+                    # has already cooled the seat, so this is genuine progress toward a fresh one,
+                    # the same as a wall-hit rotation. Counting it would be actively harmful:
+                    # several seats pausing in a row is the EXPECTED steady state once a fleet is
+                    # near its ceilings, so the breaker would trip on healthy operation and park
+                    # the repo, which is precisely the outcome the soft ceiling exists to avoid.
+                    or iteration.action.paused
+                ):
                     # A genuine wall-hit rotation (outcome() only returns HIT_WALL when the
                     # seat's OWN usage reading is at/near its ceiling) already got a real
                     # cooldown recorded by `_record_usage()`/`rotate_off()` — unambiguous

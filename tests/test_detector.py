@@ -296,7 +296,12 @@ class GadResultStatusTests(unittest.TestCase):
             "NO-PROGRESS",
             "BACKLOG-EXHAUSTED",
             "MAX-GENS-REACHED",
-            "BUDGET-EXHAUSTED",
+            # BUDGET-EXHAUSTED deliberately MOVED OUT of this list (2026-07-30): it is gad-run's
+            # "cannot afford to start the next generation" exit, which is a healthy budget stop
+            # rather than a failure, so it now classifies as a CONTINUE_ROTATE pause. See
+            # detector._PAUSED_RESULT_STATUSES for why leaving it here was a live bug (no cooldown,
+            # the same seat re-picked, a HARD_ERROR park three iterations later), and
+            # tests/test_soft_ceiling.py for its replacement coverage.
             "COMPLETED-BATCH",
             "IDEATED",
             "IDEATION-FAILED",
