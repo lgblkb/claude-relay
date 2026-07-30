@@ -291,6 +291,24 @@ def _record_usage(
 # retried forever) and notify the operator once that manual re-login is needed; a successful poll
 # at ANY time afterward (automated recovery within budget, or the operator manually re-logging in
 # after exhaustion) resets the counter and clears the notification, so this converges either way.
+#
+# RESIDUAL-GAP FIX (2026-07-30): B8's fix above closed the case the audit named — ALL seats 401,
+# total stall. It left the PARTIAL-pool case open, and that case is the common one. The budget
+# used to be charged during the per-seat scan, i.e. on every poll, whether or not the seat was
+# ever handed back for a launch. Since a 401 seat is only ever RETURNED from the last-resort
+# block (and a launch is the only thing that can refresh a token), any seat that 401'd while a
+# healthy sibling existed was charged a strike for a recovery attempt that never happened —
+# three iterations later it locked out permanently, with a "log in again" alert for an account
+# that was perfectly healthy and one launch away from fine. Because `pick_seat` concentrates
+# work on the seat with the soonest reset, idle/secondary seats are exactly the ones this hit,
+# so every underused seat in a multi-seat fleet was on a deterministic path to false lockout.
+# Field evidence: a 3-iteration overnight run charged an untouched, fully-healthy seat 3 strikes.
+# The budget now measures FAILED RECOVERY ATTEMPTS (launches we actually handed out that still
+# came back 401), not "times we noticed a stale token while busy with something better".
+# Accepted tradeoff: a genuinely dead refresh_token now takes longer to reach the operator alert,
+# because it must actually be needed as a last resort N times first — that is precisely the
+# all-seats-down situation B8's fix already targets, so nothing is lost there. A stale token seen
+# on a healthy-pool iteration is surfaced in `notes` (`auth-stale:`) instead of being charged.
 _MAX_AUTH_REFRESH_ATTEMPTS = 3
 
 
@@ -299,6 +317,8 @@ def pick_seat(
     state: dict[str, Any],
     cache: usage_mod.UsageCache,
     config: Config,
+    *,
+    dry_run: bool = False,
 ) -> tuple[fleet.Seat | None, usage_mod.UsageSnapshot | None, list[str]]:
     """Among usable, not-in-cooldown seats, prefer the lowest active-session `percent` with
     `percent < ceiling_pct(seat) - start_margin`; if none qualifies, return (None, None, notes)
@@ -311,12 +331,21 @@ def pick_seat(
 
     See the `_MAX_AUTH_REFRESH_ATTEMPTS` comment above for the B8 401-recovery policy: a seat
     within its bounded retry budget is offered as a LAST-RESORT candidate (returned with
-    `usage=None`) only when no seat with a genuine live reading is available.
+    `usage=None`) only when no seat with a genuine live reading is available. The retry budget is
+    charged ONLY for the seat this function actually hands back for a launch, never merely for
+    observing a 401 during the scan (see the RESIDUAL-GAP FIX note above).
+
+    `dry_run=True` makes this genuinely side-effect-free: no `consecutiveFailures` write and, the
+    part that actually mattered, no `notify()` — `dry_run_preview()` passes a `copy.deepcopy` of
+    `state`, which already discarded the counter write AND the notify dedupe bookkeeping, so an
+    operator sitting at the exhaustion boundary got a real, never-deduplicated Telegram message on
+    EVERY `--dry-run` from something documented as having zero side effects.
     """
     notes: list[str] = []
     disabled = cooldown.disabled_seats(state)
     candidates: list[tuple[fleet.Seat, usage_mod.UsageSnapshot]] = []
-    auth_refresh_candidates: list[fleet.Seat] = []
+    # Seats that 401'd on this scan. Deliberately NOT charged here — see the last-resort block.
+    auth_401_seats: list[fleet.Seat] = []
     for seat in seats:
         if seat.name in disabled:
             notes.append(f"disabled: {seat.name}")
@@ -334,27 +363,10 @@ def pick_seat(
             continue
         except usage_mod.UsageError as exc:
             if usage_mod.is_auth_error(exc):
-                attempts = int(cooldown.get_seat_state(state, seat.path).get("consecutiveFailures", 0)) + 1
-                cooldown.update_seat(state, seat.path, consecutive_failures=attempts)
-                if attempts > _MAX_AUTH_REFRESH_ATTEMPTS:
-                    notes.append(f"auth-exhausted: {seat.name} ({attempts} consecutive 401s)")
-                    # Not force=True: this must fire once, then stay deduped (mirrors the
-                    # needs-login pattern) — the failure recurs every iteration a permanently
-                    # dead refresh_token keeps 401ing, and force=True here would spam.
-                    notify.notify(
-                        config,
-                        state,
-                        f"auth-exhausted:{seat.path}",
-                        f"claude-relay: seat {seat.name} has failed usage-endpoint auth "
-                        f"{attempts} times in a row (HTTP 401) and will no longer be "
-                        f"auto-retried via launch. Log in again manually for this seat "
-                        f"(CLAUDE_CONFIG_DIR={seat.path}) to restore it to the pool.",
-                    )
-                else:
-                    notes.append(
-                        f"auth-refresh-attempt: {seat.name} ({attempts}/{_MAX_AUTH_REFRESH_ATTEMPTS})"
-                    )
-                    auth_refresh_candidates.append(seat)
+                # Collect only. The budget is charged in the last-resort block below, for the ONE
+                # seat actually handed back — a strike must mean "a launch was spent on this seat
+                # and it still 401'd", not "we polled it while a better seat was available".
+                auth_401_seats.append(seat)
                 continue
             notes.append(f"usage-poll-failed: {seat.name}: {exc}")
             continue
@@ -375,9 +387,53 @@ def pick_seat(
             notes.append(f"above-start-cap: {seat.name} ({percent}% >= {start_cap}%)")
 
     if not candidates:
-        if auth_refresh_candidates:
-            return auth_refresh_candidates[0], None, notes
+        # Last resort: nothing has a live reading, so offer a 401 seat purely so the next `claude`
+        # launch can refresh its token. This is the ONLY place the budget is charged, and only for
+        # the seat we actually return — one strike per launch handed out.
+        for seat in auth_401_seats:
+            charged = int(cooldown.get_seat_state(state, seat.path).get("consecutiveFailures", 0))
+            attempts = charged + 1
+            if attempts > _MAX_AUTH_REFRESH_ATTEMPTS:
+                notes.append(
+                    f"auth-exhausted: {seat.name} ({charged} refresh launches spent, all still 401)"
+                )
+                # Not force=True: this must fire once, then stay deduped (mirrors the needs-login
+                # pattern) — the failure recurs every iteration a permanently dead refresh_token
+                # keeps 401ing, and force=True here would spam. Suppressed entirely under dry_run:
+                # a preview must not message the operator.
+                if not dry_run:
+                    notify.notify(
+                        config,
+                        state,
+                        f"auth-exhausted:{seat.path}",
+                        f"claude-relay: seat {seat.name} was launched "
+                        f"{charged} times to refresh its token and still fails usage-endpoint "
+                        f"auth (HTTP 401), so it will no longer be auto-retried. Restore it by "
+                        f"logging in again for this seat (CLAUDE_CONFIG_DIR={seat.path}) — or, if "
+                        f"this seat was created by `claude-relay adopt`, re-run `claude-relay "
+                        f"adopt` instead, since its credentials are a copy that never sees the "
+                        f"source account's token refreshes.",
+                    )
+                continue
+            if dry_run:
+                # Report what WOULD be charged. Without this the preview printed `charged + 1` as
+                # though it were persisted, which reads as one strike more than reality.
+                notes.append(
+                    f"auth-refresh-attempt: {seat.name} (would be attempt "
+                    f"{attempts}/{_MAX_AUTH_REFRESH_ATTEMPTS}; not charged by a preview)"
+                )
+            else:
+                cooldown.update_seat(state, seat.path, consecutive_failures=attempts)
+                notes.append(
+                    f"auth-refresh-attempt: {seat.name} ({attempts}/{_MAX_AUTH_REFRESH_ATTEMPTS})"
+                )
+            return seat, None, notes
         return None, None, notes
+
+    # A healthy seat won, so every 401 seat above goes UNCHARGED — surface it so a stale token is
+    # still visible to the operator (in `seats`/`--dry-run` notes) without consuming its budget.
+    for seat in auth_401_seats:
+        notes.append(f"auth-stale: {seat.name} (401 on poll; budget not charged, a live seat won)")
 
     # Spend PERISHABLE capacity first (DESIGN.md §4): among seats that pass the start-cap gate,
     # prefer the one whose 5h window resets SOONEST — its remaining headroom is about to refresh
@@ -657,7 +713,9 @@ def dry_run_preview(repo: Path, config: Config, state: dict[str, Any]) -> dict[s
         preview["argv"] = runner.build_claude_argv(gadkit.command(plan), resolved)[1:]  # drop "claude"
         seats = fleet.discover_seats(config.effective_exclude())
         cache = usage_mod.UsageCache()
-        seat, seat_usage, notes = pick_seat(seats, copy.deepcopy(state), cache, config)
+        seat, seat_usage, notes = pick_seat(
+            seats, copy.deepcopy(state), cache, config, dry_run=True
+        )
         preview["seat"] = seat.name if seat else None
         preview["seat_notes"] = notes
         if seat_usage is not None:

@@ -318,6 +318,105 @@ class Auth401RecoveryTests(unittest.TestCase):
         self.assertEqual(cooldown.get_seat_state(state, seat.path).get("consecutiveFailures"), 0)
         self.assertFalse(cooldown.was_notified(state, f"auth-exhausted:{seat.path}"))
 
+    def test_a_401_seat_is_never_charged_while_a_healthy_peer_keeps_winning(self) -> None:
+        """THE STARVATION REGRESSION (residual gap in B8's own fix, found in the field
+        2026-07-30). The three pre-existing tests in this class cover the budget only with the
+        401 seat ALONE in the pool; none combines "a healthy peer is present" with "called
+        repeatedly" — which is the exact combination that used to rot a seat out of the pool.
+
+        A strike must mean "a refresh launch was spent on this seat and it still 401'd". While a
+        healthy peer keeps winning, this seat is never handed back, so no launch ever happens, so
+        no strike may be charged — otherwise a completely healthy account (its access token merely
+        stale, refresh token fine) locks out permanently after N iterations and demands a manual
+        re-login it never needed. Field evidence: a 3-iteration overnight run charged an untouched
+        seat 3 strikes; the operator had to log in by hand to clear it.
+        """
+        good = _seat("good")
+        bad = _seat("bad-401")
+        cache = _401ThenHealthyCache({str(good.path): _usage_at(30.0)}, failing={str(bad.path)})
+        state = _state()
+        config = Config(notify_sink="stdout")
+        with mock.patch.object(loop.notify, "dispatch", return_value=True) as fake_dispatch:
+            for _ in range(loop._MAX_AUTH_REFRESH_ATTEMPTS * 3):
+                picked, seat_usage, notes = loop.pick_seat([bad, good], state, cache, config)
+                self.assertEqual(picked, good)
+                self.assertIsNotNone(seat_usage)
+                # Surfaced, but explicitly not charged.
+                self.assertTrue(any("auth-stale: bad-401" in n for n in notes), notes)
+                self.assertFalse(any("auth-exhausted" in n for n in notes), notes)
+            self.assertEqual(fake_dispatch.call_count, 0)
+
+        # The whole point: after many iterations the untouched seat is still pristine, so the
+        # moment it IS genuinely needed it still has its full refresh budget available.
+        self.assertEqual(
+            int(cooldown.get_seat_state(state, bad.path).get("consecutiveFailures", 0)), 0
+        )
+        self.assertFalse(cooldown.was_notified(state, f"auth-exhausted:{bad.path}"))
+
+        # And when the healthy peer goes away, it is offered immediately with a fresh budget.
+        cache.failing.add(str(good.path))
+        picked, _usage, notes = loop.pick_seat([bad, good], state, cache, config)
+        self.assertIn(picked, (bad, good))
+        self.assertTrue(any("auth-refresh-attempt" in n for n in notes), notes)
+
+    def test_the_budget_is_charged_once_per_launch_actually_handed_out(self) -> None:
+        """Complement to the test above: with no healthy peer the seat IS returned for a launch,
+        and that is exactly when one strike is charged — so the bounded-retry guarantee B8 added
+        still holds and a dead refresh_token still converges on the operator alert.
+        """
+        seat = _seat("only-seat-401")
+        cache = _401ThenHealthyCache({}, failing={str(seat.path)})
+        state = _state()
+        config = Config(notify_sink="stdout")
+        with mock.patch.object(loop.notify, "dispatch", return_value=True):
+            for expected in (1, 2, 3):
+                picked, _usage, _notes = loop.pick_seat([seat], state, cache, config)
+                self.assertEqual(picked, seat)
+                self.assertEqual(
+                    int(cooldown.get_seat_state(state, seat.path).get("consecutiveFailures", 0)),
+                    expected,
+                )
+
+    def test_dry_run_neither_charges_the_budget_nor_notifies(self) -> None:
+        """`dry_run_preview()` is documented as having zero side effects, but it reaches this
+        function, and `notify()` used to be called here unconditionally. Its dedupe bookkeeping
+        rode on the preview's throwaway `copy.deepcopy(state)`, so it never stuck — meaning an
+        operator sitting past the budget got a REAL, never-deduplicated Telegram message on every
+        single `--dry-run`. Also pins the reporting fix: a preview must not print `charged + 1` as
+        though it were already persisted (that reads as one strike more than reality).
+        """
+        seat = _seat("preview-401")
+        cache = _401ThenHealthyCache({}, failing={str(seat.path)})
+        config = Config(notify_sink="stdout")
+
+        # Within budget: returned for a would-be launch, but nothing is charged.
+        state = _state()
+        with mock.patch.object(loop.notify, "dispatch", return_value=True) as fake_dispatch:
+            picked, _usage, notes = loop.pick_seat([seat], state, cache, config, dry_run=True)
+            self.assertEqual(picked, seat)
+            self.assertTrue(any("would be attempt 1/" in n for n in notes), notes)
+            self.assertEqual(
+                int(cooldown.get_seat_state(state, seat.path).get("consecutiveFailures", 0)), 0
+            )
+            self.assertEqual(fake_dispatch.call_count, 0)
+
+        # Past budget: the exhaustion path is reached, and still must not message the operator.
+        state = _state()
+        cooldown.update_seat(
+            state, seat.path, consecutive_failures=loop._MAX_AUTH_REFRESH_ATTEMPTS
+        )
+        with mock.patch.object(loop.notify, "dispatch", return_value=True) as fake_dispatch:
+            picked, _usage, notes = loop.pick_seat([seat], state, cache, config, dry_run=True)
+            self.assertIsNone(picked)
+            self.assertTrue(any("auth-exhausted" in n for n in notes), notes)
+            self.assertEqual(fake_dispatch.call_count, 0)
+
+        # Same state, live call: now it DOES notify — proving the gate is dry_run, not the state.
+        with mock.patch.object(loop.notify, "dispatch", return_value=True) as fake_dispatch:
+            picked, _usage, _notes = loop.pick_seat([seat], state, cache, config)
+            self.assertIsNone(picked)
+            self.assertEqual(fake_dispatch.call_count, 1)
+
 
 class EarliestWaitAndWaitSecondsTests(unittest.TestCase):
     """B2 (zero-sleep busy loop) + B17 (unbounded wait): `_earliest_wait()` must filter out
