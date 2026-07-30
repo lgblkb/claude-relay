@@ -198,6 +198,12 @@ class Plan:
     detail: str = ""
     tier: str = "budget"
     token_target: str = "+2M"
+    # Output tokens this launch may spend before gad-kit pauses itself at the next unit boundary.
+    # None == unbounded (the arg is omitted entirely and every gad-kit gate is inert), which is both
+    # the default and what a plan built before the seat is known must carry: `run_once()` fills it in
+    # via `dataclasses.replace()` once `pick_seat()` has said WHICH seat, since the number is derived
+    # from that seat's live headroom. See `command()`'s `allowance_arg` and Config.launch_budget_for.
+    token_allowance: int | None = None
     gen_type: str | None = None  # gad-kit 2.0 genType; None == 'build' (the workflow default)
     stashed_ref: str | None = None
     blocking_decision_ids: tuple[str, ...] = ()
@@ -450,6 +456,84 @@ def generation_dir(repo: Path, gen: int) -> Path:
 
 def handoff_path(repo: Path, gen: int) -> Path:
     return generation_dir(repo, gen) / "handoff.md"
+
+
+def calibration_path(repo: Path) -> Path:
+    """Where gad-run appends one JSON line per completed crawl recording its true
+    `budget.spent()`. Repo-level, not per-generation: a single launch's crawl can span several
+    generations and the figure is per-LAUNCH.
+    """
+    return Path(repo) / ".gad" / "calibration.jsonl"
+
+
+@dataclasses.dataclass(frozen=True)
+class Calibration:
+    """One `.gad/calibration.jsonl` record — how many OUTPUT tokens a launch actually spent.
+
+    This exists because the number is otherwise unobtainable. `budget.spent()` is readable only
+    from inside a workflow script, and the run's own NDJSON usage envelopes cover just the
+    supervising `-p` wrapper turn (measured: 1,676 output tokens reported for a run that really
+    cost ~1.1M tokens of all types, because subagent usage never lands in the top-level envelope).
+    So gad-kit writes it to disk and relay reads it back — a durable disk fact, not model prose,
+    which keeps the calibration path on the right side of Invariant #2.
+
+    `records` is the total line count, which is how `run_once()` tells a FRESH record from a stale
+    one left by an earlier launch: only a strictly higher count after a run means this run wrote it.
+    """
+
+    spent_output_tokens: int
+    status: str
+    gens_committed: int
+    records: int
+
+
+def read_calibration(repo: Path) -> Calibration | None:
+    """The LAST record in `.gad/calibration.jsonl`, or None if the file is absent/unusable.
+
+    Fully defensive: the file is written by an agent appending a line, so a truncated, duplicated
+    or garbage line is a realistic failure mode, and calibration is advisory data whose absence must
+    never break a run. Scans for the last line that parses AND carries a plausible positive token
+    count, so one bad append does not discard a good earlier record.
+    """
+    path = calibration_path(repo)
+    try:
+        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except (OSError, UnicodeDecodeError):
+        return None
+    for line in reversed(lines):
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        try:
+            spent = int(obj["spentOutputTokens"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if spent <= 0:
+            continue
+        try:
+            gens = int(obj.get("gensCommitted", 0))
+        except (TypeError, ValueError):
+            gens = 0
+        return Calibration(
+            spent_output_tokens=spent,
+            status=str(obj.get("status", "")),
+            gens_committed=gens,
+            records=len(lines),
+        )
+    return None
+
+
+def calibration_record_count(repo: Path) -> int:
+    """Cheap pre-run line count for the fresh-record check in `read_calibration`'s docstring."""
+    try:
+        return sum(
+            1 for ln in calibration_path(repo).read_text(encoding="utf-8").splitlines() if ln.strip()
+        )
+    except (OSError, UnicodeDecodeError):
+        return 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1186,6 +1270,25 @@ def command(plan: Plan) -> list[str]:
     # backlog entry, so a single value there would mislabel every other generation in the crawl.
     gen_type_arg: dict[str, Any] = {} if plan.gen_type is None else {"genType": plan.gen_type}
 
+    # The soft usage ceiling's ONLY enforcement channel (2026-07-30). Omitted entirely when None,
+    # which is both the pre-existing behaviour and the "unbounded" signal gad-kit's `shouldPause()`
+    # checks for — so a plan with no allowance produces byte-identical args to before this existed.
+    #
+    # Why an ARG rather than the `token_target` prompt directive: gad-kit gates on `budget.spent()`
+    # compared against this number, because the harness's own `budget.total`/`budget.remaining()`
+    # are permanently inert (see the TOKEN_TARGET note below, and Config.tokens_per_percent for the
+    # bundle disassembly). A workflow script has no network and no filesystem, so an arg is the only
+    # channel by which a headroom figure computed OUT HERE can reach a decision made IN THERE.
+    #
+    # Threaded into ALL THREE modes, unlike `genType`: an allowance is a property of the LAUNCH
+    # (this seat, this much window left), not of a generation, so every script this launch starts
+    # must respect the same number. gad-run additionally forwards it to the child generations it
+    # spawns, and since `budget.spent()` is process-cumulative across parent and children they all
+    # draw down ONE shared pool rather than each receiving a fresh allowance.
+    allowance_arg: dict[str, Any] = (
+        {} if plan.token_allowance is None else {"tokenAllowance": int(plan.token_allowance)}
+    )
+
     if plan.mode == "gad_finish":
         script = str(root / "workflows" / "gad-finish.js")
         wf_args: dict[str, Any] = {
@@ -1194,6 +1297,7 @@ def command(plan: Plan) -> list[str]:
             "rolesDir": roles_dir,
             "profile": plan.tier,
             **gen_type_arg,
+            **allowance_arg,
         }
     elif plan.mode == "gad_generation":
         script = str(root / "workflows" / "gad-generation.js")
@@ -1203,6 +1307,7 @@ def command(plan: Plan) -> list[str]:
             "rolesDir": roles_dir,
             "profile": plan.tier,
             **gen_type_arg,
+            **allowance_arg,
         }
     elif plan.mode == "gad_run":
         script = str(root / "workflows" / "gad-run.js")
@@ -1213,6 +1318,7 @@ def command(plan: Plan) -> list[str]:
             "finishScript": str(root / "workflows" / "gad-finish.js"),
             "profile": plan.tier,
             "maxGens": 1,
+            **allowance_arg,
         }
         # TOKEN_TARGET (e.g. "+2M"): DOCS-ONLY B22 audit fix (2026-07-26) — this used to be
         # documented (here and in README.md/DESIGN.md/config.example.toml) as "gad-run.js self-

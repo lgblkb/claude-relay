@@ -187,12 +187,21 @@ def update_seat(
     last_resets_at: str | None = None,
     last_seen_at: str | None = None,
     consecutive_failures: int | None = None,
+    tokens_per_percent: float | None = None,
     note: str | None = "__unset__",
 ) -> None:
     """Merge-update one seat's entry. Sentinel `"__unset__"` means "leave unchanged" for the
     two fields (`cooldown_until`, `note`) whose real value is legitimately `None`. `last_seen_at`
     (ISO-8601 of when this seat's usage was last actually observed) is set only when provided —
     it lets a read-only observer (the monitor) label a fallback reading with its age.
+
+    `tokens_per_percent` is the LEARNED calibration for the soft usage ceiling (2026-07-30): how
+    many output tokens one percent of this seat's 5-hour window actually holds, as measured from
+    real runs by `loop._learn_tokens_per_percent()`. It lives in seat state rather than config
+    because it is an observation, not a setting — accounts differ by subscription tier, so a
+    single global constant cannot serve the fleet, and an operator should not have to hand-tune a
+    number the supervisor can measure. `config.resolve_seat_tokens_per_percent()` still lets an
+    explicitly pinned per-seat value outrank whatever was learned.
     """
     key = _seat_key(seat_dir)
     entry = state["seats"].setdefault(
@@ -218,8 +227,28 @@ def update_seat(
         entry["lastSeenAt"] = last_seen_at
     if consecutive_failures is not None:
         entry["consecutiveFailures"] = consecutive_failures
+    if tokens_per_percent is not None:
+        entry["tokensPerPercent"] = float(tokens_per_percent)
     if note != "__unset__":
         entry["note"] = note
+
+
+def learned_tokens_per_percent(state: dict[str, Any], seat_dir: Path | str) -> float | None:
+    """This seat's learned tokens-per-percent, or None if nothing plausible has been measured yet.
+
+    Guards the read rather than the write so a hand-edited or older state file cannot feed a
+    string/zero/negative into the token-target arithmetic — a garbage rate here would either make
+    every seat unstartable or hand out budgets large enough to blow straight through the ceiling
+    the calibration exists to respect.
+    """
+    raw = get_seat_state(state, seat_dir).get("tokensPerPercent")
+    try:
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if value <= 0 or value != value or value in (float("inf"), float("-inf")):
+        return None
+    return value
 
 
 def disabled_seats(state: dict[str, Any]) -> set[str]:

@@ -56,10 +56,56 @@ start_margin = 5
 # top-level `exclude` above (which hides a directory entirely) and from `main = true` below.
 adopt_default = "always"
 
+# ── The soft usage ceiling (optional; OFF by default) ────────────────────────────────────────────
+# `ceiling_pct` above decides which seat to START on, and that is all it can do — nothing stops a
+# run that has already begun from consuming the rest of the window. In the field a seat with a 70%
+# ceiling finished a run at 97%. These keys close that gap: relay converts the headroom left below a
+# seat's ceiling into an OUTPUT-TOKEN allowance, passes it to gad-kit as its `tokenAllowance`
+# workflow arg, and gad-kit pauses itself at the next phase boundary once it has spent that much —
+# without ever killing an agent mid-flight. It then reports `RESULT: PAUSED`, which relay treats as
+# healthy: cool the seat, rotate, resume the generation on a seat that still has headroom.
+#
+# `tokens_per_percent` is the conversion rate: how many output tokens one percent of a five-hour
+# window holds. It has to be measured, and relay measures it for you — each run leaves its true
+# `budget.spent()` in the repo's `.gad/calibration.jsonl`, which relay pairs with the seat's observed
+# percent delta and folds into a learned per-seat rate (visible in `claude-relay status`). Leave
+# `derive_token_target = false` for a few runs, let the learned rates settle, then switch it on.
+#
+# ⚠️ Turning it on with a wrong rate breaks the pool in one of three ways: too HIGH and the allowance
+# never binds (inert); too LOW and no seat can fund a phase, so nothing runs at all; phase estimates
+# too high relative to the rate and every generation pauses immediately. Hence off by default.
+#
+# Two halves enforce this, and BOTH are needed. The in-flight pause only fires at a gate gad-kit
+# actually reaches, and its pre-Verify gates are off by default for resume safety — so a generation
+# whose Verify is clean on the first iteration never consults the allowance at all. What bounds that
+# run is `min_token_target`: relay simply refuses to START a seat that cannot afford a whole
+# generation. The pause then covers the tail the launch gate cannot predict — a verify loop that
+# keeps finding work, which is exactly the overshoot case that motivated all this.
+#
+# derive_token_target = false   # the master switch; false ⇒ no allowance is passed and all of this is inert
+# tokens_per_percent = 1200     # [defaults] fallback only — a LEARNED per-seat rate outranks it.
+#                               # ⚠️ This DEFAULT is an estimate and is deliberately too low to be
+#                               # usable: enabling derivation without raising it is REJECTED at
+#                               # config load, because (70 - 5) * 1200 = 78k is under the floor below,
+#                               # so every seat would be skipped and the pool would idle forever with
+#                               # no way to recover (a seat that never launches never learns a rate).
+# headroom_safety_pct = 5       # aim this far BELOW the ceiling; overshoot is the harmful direction
+# min_token_target = 860000     # a seat whose headroom is worth less than this is SKIPPED, not started
+#                               # on a budget it cannot finish. The default is gad-kit's own
+#                               # phaseTokens summed over a clean generation (Plan 60k + PlanReview
+#                               # 90k + Prep 60k + Implement 300k + Guardrails 120k + Verify 150k +
+#                               # Consolidate 80k), i.e. "only start a seat that can afford a whole
+#                               # generation". Lowering it re-opens the overshoot.
+
 # Per-seat overrides — one [seats.<name>] table per seat you want to special-case. `<name>` is
 # the suffix after "~/.claude-" (e.g. "~/.claude-sam" -> "sam").
 # [seats.sam]
 # ceiling_pct = 85          # give this seat a higher (or lower) ceiling than [defaults]
+# tokens_per_percent = 30000  # pin this account's rate, OVERRIDING whatever relay learned. Worth
+#                           # setting only when you know the tier differs sharply: one percent of a
+#                           # Max 20x window holds several times the tokens of one percent of a Pro
+#                           # window, so a single global rate starves the large seats and overshoots
+#                           # the small ones.
 # [seats.dias]
 # main = true               # a daily-driver seat you still use interactively — kept OUT of the pool
 # [seats.retired-seat]

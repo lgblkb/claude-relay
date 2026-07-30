@@ -66,6 +66,26 @@ class SeatConfig:
     ceiling_pct: float | None = None  # None = fall back to [defaults].ceiling_pct
     exclude: bool = False
     main: bool = False
+    # None = fall back to [defaults].tokens_per_percent. Per-seat because Claude accounts differ by
+    # SUBSCRIPTION TIER: one percent of a Max 20x five-hour window holds several times the tokens of
+    # one percent of a Pro window, so a single global constant would starve the large seats and
+    # overshoot the small ones. See Config.tokens_per_percent.
+    tokens_per_percent: float | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class LaunchBudget:
+    """`Config.launch_budget_for()`'s answer: may this seat be launched, and if so under what
+    output-token allowance. `reason` is operator-facing text for the pick_seat notes / run log —
+    "why was this seat skipped" and "how big a budget did it get, and from what" are both questions
+    that get asked at 3am, and neither is reconstructible from the numbers after the fact.
+    """
+
+    startable: bool
+    # Output tokens this launch may spend. None means UNBOUNDED — not zero. Only meaningful when
+    # `startable`; a non-startable budget carries no allowance at all.
+    allowance: int | None = None
+    reason: str = ""
 
 
 @dataclasses.dataclass
@@ -87,6 +107,102 @@ class Config:
     # start_margin. See `resolve_seat_ceiling()` for the full per-seat precedence.
     ceiling_pct: float = 70.0
     start_margin: float = 5.0
+
+    # ── Soft-ceiling → token-budget bridge ────────────────────────────────────────────────────
+    # `ceiling_pct` above is only a PRE-LAUNCH gate: it decides which seat to start on and when to
+    # rotate off afterwards, but nothing stops a long run from consuming the rest of the window
+    # once it has started (observed: a seat with a 70% ceiling finishing a run at 97%). gad-kit's
+    # workflow scripts cannot poll usage themselves — they have no network and no filesystem, only
+    # the harness `budget` object — so the ONLY way to express "stop at N% of this seat's 5-hour
+    # window" *inside* a generation is to hand the run an output-token allowance sized to the seat's
+    # remaining headroom, and let gad-kit pause itself at a unit boundary once it has spent that much.
+    #
+    # ⚠️ SCOPE, stated honestly because it is narrower than "pauses at any phase boundary": the
+    # pause can only fire at a gate gad-kit actually reaches, and every pre-Verify gate is disabled by
+    # default for resume safety (see min_token_target). A generation whose Verify is clean on the
+    # first iteration therefore never consults the allowance at all. What bounds THAT run is the
+    # `min_token_target` LAUNCH GATE — relay simply does not start a seat that cannot afford a whole
+    # generation. The in-flight pause covers the tail case the launch gate cannot predict: a verify
+    # loop that keeps finding work. Both halves are needed; neither alone closes the overshoot.
+    #
+    # ⚠️ The allowance travels as a WORKFLOW ARG (`tokenAllowance`, see gadkit.command()), NOT as the
+    # `token_target` prompt directive, and gad-kit gates on `budget.spent()`, NOT on
+    # `budget.remaining()`. That is forced by the CLI, verified by disassembling the installed
+    # bundle (2.1.220): the workflow sandbox builds `budget.total` from a module variable that is
+    # initialized to null and whose ONLY writer is a function with zero call sites anywhere in the
+    # bundle — so `budget.total` is ALWAYS null and `budget.remaining()` is ALWAYS Infinity, no
+    # matter what the `+2M` directive says. `budget.spent()` is the one member that works: it sums
+    # `outputTokens` across all model usage in the `claude` PROCESS, from a baseline that is likewise
+    # never advanced, so it is process-cumulative. Relay launches exactly one process per run, so
+    # process-cumulative and per-run coincide here — which is what makes a flat per-launch allowance
+    # correct, including across gad-run's multi-generation crawl (parent and children share the one
+    # counter, so the allowance is a single shared pool needing no per-generation subdivision).
+    #
+    # `tokens_per_percent` converts one percent of a 5h window into the OUTPUT tokens that
+    # `budget.spent()` actually counts. `[seats.<name>].tokens_per_percent` overrides it per
+    # account, and loop.py refines a learned per-seat value from each run's observed ratio, so
+    # subscription-tier differences converge on their own without the operator declaring a tier.
+    #
+    # ⚠️ THE DEFAULT IS AN ESTIMATE, NOT A MEASUREMENT, and it is the least certain number in this
+    # module. `budget.spent()` counts output tokens summed over every subagent, which is NOT a
+    # figure the run logs expose: a full generation on this project reported ~1.48M tokens of all
+    # types (dominated by cache reads) for ~100% of a five-hour window, and output is typically a
+    # small single-digit-to-ten-percent share of such a mix — hence ~1.2k output tokens per
+    # percent. It is calibrated for real WITHOUT the operator doing arithmetic: gad-run appends its
+    # true `budget.spent()` to `.gad/calibration.jsonl`, and `loop._learn_tokens_per_percent()`
+    # divides that by the seat's observed percent delta for the same run and stores the ratio in
+    # seat state, where it outranks this default (see `resolve_seat_tokens_per_percent`).
+    #
+    # Error directions are NOT symmetric. Too HIGH ⇒ the derived target never binds and the soft
+    # pause silently never fires (inert, fails safe). Too LOW ⇒ every seat is judged unable to
+    # fund even one phase; `derive_token_target_for()` returns None and the seat is skipped rather
+    # than started, which is why an under-estimate degrades into "no seat is startable" instead of
+    # the far worse "pause before Plan on every seat, forever, making no progress".
+    tokens_per_percent: float = 1200.0
+    # Subtracted from the headroom before conversion so the derived target aims BELOW the ceiling
+    # instead of exactly at it. The conversion is noisy and overshoot is the harmful direction.
+    headroom_safety_pct: float = 5.0
+    # ⚠️ OFF BY DEFAULT, deliberately. Turning derivation on without a MEASURED
+    # `tokens_per_percent` for your accounts is actively dangerous, because the same unknown scale
+    # appears twice — here, and in gad-kit's per-phase `PHASE_TOKENS` estimates — and getting the
+    # ratio wrong breaks the pool in one of three ways:
+    #   • rate too HIGH  ⇒ the target never binds; the soft pause never fires (inert).
+    #   • rate too LOW   ⇒ no seat can fund one phase; every seat is skipped; nothing ever runs.
+    #   • phase estimates too HIGH relative to the rate ⇒ every generation pauses immediately.
+    # With this False, no `tokenAllowance` arg is passed at all, so every gad-kit gate is inert (they
+    # are all no-ops when the allowance is absent) and behaviour is bit-for-bit unchanged.
+    #
+    # ROLLOUT, and it is self-calibrating: run generations with this False. Each run leaves its real
+    # `budget.spent()` in `.gad/calibration.jsonl`, and loop.py pairs it with the seat's percent delta
+    # to learn that account's true output-tokens-per-percent into seat state (visible in
+    # `claude-relay status`). Once a seat has a learned rate that looks stable, sanity-check gad-kit's
+    # `phaseTokens` against the same scale and set this True. Pin
+    # `[seats.<name>].tokens_per_percent` only to OVERRIDE what was learned.
+    derive_token_target: bool = False
+    # Floor, and it is a LAUNCH GATE rather than a clamp: a seat whose headroom is worth less than
+    # this is SKIPPED by `pick_seat()`, not started with a small allowance.
+    #
+    # ⚠️ THE FLOOR IS THE PRIMARY ENFORCEMENT MECHANISM, not a safety detail — because the pause
+    # cannot stop a generation that never reaches a pause point. gad-kit's gates before Verify are
+    # all behind `pauseBeforeVerifyPhases`, which defaults OFF for a hard resume-safety reason (a
+    # pre-Verify pause leaves no `reviews/verification.md`, so relay's artifact census reads "nothing
+    # happened", and `triage()` responds by `git stash push -u`-ing the whole tree and restarting
+    # from Preflight — and nothing ever pops that stash). What remains enabled by default is the
+    # verify-loop continuation gate and the VerifyFix gate. So for a generation whose Verify comes
+    # back clean on the first iteration, NO gate is ever consulted and the run bills its full cost
+    # regardless of the allowance.
+    #
+    # Hence this default: gad-kit's own PHASE_TOKENS summed over a clean generation —
+    # Plan 60k + PlanReview 90k + Prep 60k + Implement 300k + Guardrails 120k + Verify 150k
+    # + Consolidate 80k = 860k. Read it as the real rule it encodes: **only start a seat that can
+    # afford a WHOLE generation.** The soft pause then earns its keep on the expensive tail —
+    # a verify loop that keeps finding work — which is precisely the overshoot case that motivated
+    # the feature (a 70%-ceiling seat observed finishing at 97%).
+    #
+    # A floor materially below this re-opens that overshoot: the run sails past every disabled gate,
+    # and the allowance bounds nothing. A floor above it merely makes seats startable less often.
+    # Keep it in step with gad-kit's `phaseTokens` if those estimates are ever retuned.
+    min_token_target: int = 860_000
     # When `claude-relay init`/`adopt` runs, whether to turn a bare ~/.claude login into a named
     # seat (~/.claude-default): "always" (default) adopts it whenever ~/.claude has a login and
     # the seat doesn't exist yet; "if-empty" only when no other named seats exist; "never" skips.
@@ -144,6 +260,79 @@ class Config:
             return seat_cfg.ceiling_pct
         return self.ceiling_pct
 
+    def resolve_seat_tokens_per_percent(
+        self, seat_name: str, *, learned: float | None = None
+    ) -> float:
+        """Tokens per one percent of `seat_name`'s 5-hour window. Precedence (highest first):
+        `[seats.<name>].tokens_per_percent` > the `learned` value loop.py measured from this
+        seat's own past runs > `[defaults].tokens_per_percent`.
+
+        An explicit per-seat number outranks the learned one deliberately: if an operator has
+        pinned a value for an account, that is a statement of intent about a known subscription
+        tier, and a noisy measurement should not silently override it.
+        """
+        seat_cfg = self.seat_configs.get(seat_name)
+        if seat_cfg is not None and seat_cfg.tokens_per_percent is not None:
+            return seat_cfg.tokens_per_percent
+        if learned is not None and learned > 0:
+            return float(learned)
+        return self.tokens_per_percent
+
+    def launch_budget_for(
+        self, seat_name: str, current_pct: float | None, *, learned: float | None = None
+    ) -> LaunchBudget:
+        """What one launch on `seat_name` may spend, given that seat's live usage percent.
+
+        This is the bridge that lets gad-kit's in-script soft pause mean "stop at N% of THIS
+        account's 5-hour window" — see Config.tokens_per_percent for the mechanism and for why the
+        figure is an output-token allowance rather than the `token_target` prompt directive.
+
+        Three genuinely different answers, which is why this returns a small record instead of an
+        overloaded `int | None`:
+
+        * `startable, allowance=None` — derivation is off, or the seat has no live reading to size
+          against. The launch proceeds UNBOUNDED (no `tokenAllowance` arg, gad-kit's gates inert):
+          with no reading there is no headroom to size against, and guessing would be strictly worse
+          than the pre-existing behaviour.
+        * `startable, allowance=N` — spend at most N output tokens.
+        * **not startable** — the headroom cannot fund `min_token_target`, so THIS SEAT MUST NOT BE
+          LAUNCHED AT ALL. Callers must honour that. Handing over a too-small allowance instead
+          would livelock: gad-kit would pause before its first phase, relay would rotate, the next
+          seat would pause before its first phase too, and the pool would spend a launch per seat
+          while making no progress whatsoever.
+        """
+        if not self.derive_token_target:
+            return LaunchBudget(startable=True, reason="token-allowance derivation disabled")
+        if current_pct is None:
+            return LaunchBudget(startable=True, reason="no live usage reading to size against")
+        ceiling = self.resolve_seat_ceiling(seat_name)
+        headroom_pct = ceiling - current_pct - self.headroom_safety_pct
+        per_pct = self.resolve_seat_tokens_per_percent(seat_name, learned=learned)
+        tokens = int(max(0.0, headroom_pct) * per_pct)
+        if tokens < self.min_token_target:
+            return LaunchBudget(
+                startable=False,
+                reason=(
+                    f"{max(0.0, headroom_pct):.1f}% of headroom below the {ceiling}% ceiling "
+                    f"(at {current_pct}%, less {self.headroom_safety_pct}% safety) is worth only "
+                    f"~{tokens} output tokens at {per_pct:.0f}/pct — under the "
+                    f"{self.min_token_target} floor needed to carry a whole generation"
+                ),
+            )
+        # Never exceed the operator's global target: `token_target` stays a hard upper bound, so
+        # enabling derivation can only ever make a launch's budget SMALLER, never larger.
+        cap = parse_token_target(self.token_target)
+        if cap is not None:
+            tokens = min(tokens, cap)
+        return LaunchBudget(
+            startable=True,
+            allowance=tokens,
+            reason=(
+                f"{max(0.0, headroom_pct):.1f}% of headroom below the {ceiling}% ceiling "
+                f"at {per_pct:.0f} output tokens/pct"
+            ),
+        )
+
     def effective_exclude(self) -> list[str]:
         """`exclude` merged with any `[seats.<name>]` marked `exclude = true` or `main = true`."""
         names = set(self.exclude)
@@ -151,6 +340,33 @@ class Config:
             if seat_cfg.exclude or seat_cfg.main:
                 names.add(name)
         return sorted(names)
+
+
+def parse_token_target(raw_value: str | None) -> int | None:
+    """Parse a token-target directive (`"+2M"`, `"500k"`, `"+350000"`) into an integer count.
+
+    Returns None for anything unparseable, including None itself — callers treat that as "no
+    stated bound" rather than zero, because a misread directive must never silently become a
+    budget of nothing. Deliberately tolerant of a missing `+` and of either case for the k/M
+    suffix, since this string is hand-written in config.toml.
+    """
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip().lstrip("+").replace("_", "")
+    if not text:
+        return None
+    multiplier = 1
+    if text[-1] in ("k", "K"):
+        multiplier, text = 1_000, text[:-1]
+    elif text[-1] in ("m", "M"):
+        multiplier, text = 1_000_000, text[:-1]
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return int(value * multiplier)
 
 
 def _to_float(raw_value: Any, field: str) -> float:
@@ -203,14 +419,79 @@ def _validate(cfg: Config) -> None:
             f"({cfg.ceiling_pct!r}) — otherwise no seat's percent can ever be low enough to "
             "start a fresh unit on, and the pool silently never runs anything"
         )
+    if cfg.tokens_per_percent <= 0.0:
+        raise ConfigError(
+            f"[defaults].tokens_per_percent must be > 0, got {cfg.tokens_per_percent!r} — a "
+            "zero or negative rate would derive a token target of nothing for every seat and "
+            "make gad-kit pause before its very first phase, forever"
+        )
+    if cfg.headroom_safety_pct < 0.0:
+        raise ConfigError(
+            f"[defaults].headroom_safety_pct must be >= 0, got {cfg.headroom_safety_pct!r}"
+        )
+    if cfg.min_token_target <= 0:
+        raise ConfigError(
+            f"[defaults].min_token_target must be > 0, got {cfg.min_token_target!r}"
+        )
     for name, seat_cfg in cfg.seat_configs.items():
         if seat_cfg.ceiling_pct is not None and not (0.0 < seat_cfg.ceiling_pct <= 100.0):
             raise ConfigError(
                 f"[seats.{name}].ceiling_pct must be in (0, 100], got {seat_cfg.ceiling_pct!r}"
             )
+        if seat_cfg.tokens_per_percent is not None and seat_cfg.tokens_per_percent <= 0.0:
+            raise ConfigError(
+                f"[seats.{name}].tokens_per_percent must be > 0, got "
+                f"{seat_cfg.tokens_per_percent!r}"
+            )
     for name, pct in cfg.ceiling_overrides.items():
         if not (0.0 < pct <= 100.0):
             raise ConfigError(f"--ceiling {name}={pct!r} must be in (0, 100]")
+
+    if cfg.derive_token_target:
+        # Refuse an ARITHMETICALLY UNSATISFIABLE combination rather than accept it and idle.
+        #
+        # Every individual value can be perfectly legal while the set of them makes EVERY seat
+        # unstartable — and the failure is silent and self-sealing, which is what makes it worth a
+        # hard error. The best case any seat can ever present is a completely fresh window at 0%
+        # usage, worth `(ceiling - safety) * rate` tokens; if even that is under `min_token_target`
+        # then `launch_budget_for()` returns not-startable for every seat at every percent forever,
+        # `pick_seat()` finds no candidate, and the pool waits on cooldowns that will never help.
+        # It cannot recover on its own either: a seat that never launches never writes a calibration
+        # record, so it can never learn the better rate that would have made it startable.
+        #
+        # The shipped defaults are exactly this shape on purpose — (70 - 5) * 1200 = 78k against a
+        # 860k floor — because `tokens_per_percent`'s default is an ESTIMATE, and the honest response
+        # to "you enabled derivation without measuring your accounts" is to say so at startup rather
+        # than to look healthy and quietly stop working.
+        best_ceiling = max(
+            [cfg.ceiling_pct]
+            + [sc.ceiling_pct for sc in cfg.seat_configs.values() if sc.ceiling_pct is not None]
+            + list(cfg.ceiling_overrides.values())
+        )
+        best_rate = max(
+            [cfg.tokens_per_percent]
+            + [
+                sc.tokens_per_percent
+                for sc in cfg.seat_configs.values()
+                if sc.tokens_per_percent is not None
+            ]
+        )
+        best_case = (best_ceiling - cfg.headroom_safety_pct) * best_rate
+        if best_case < cfg.min_token_target:
+            raise ConfigError(
+                "[defaults].derive_token_target is true, but no seat can ever clear the launch "
+                f"floor: the most generous case possible — a fresh window at 0% usage under the "
+                f"highest configured ceiling ({best_ceiling}%), less {cfg.headroom_safety_pct}% "
+                f"safety, at the highest configured rate ({best_rate:.0f} tokens/pct) — is worth "
+                f"{best_case:.0f} output tokens, under the {cfg.min_token_target} "
+                "min_token_target. Every seat would be skipped and the pool would never run "
+                "anything. Fix by MEASURING your accounts: leave derive_token_target = false for a "
+                "few runs and let relay learn each seat's tokens_per_percent from "
+                ".gad/calibration.jsonl (see `claude-relay status`), then raise "
+                "[defaults].tokens_per_percent — or pin [seats.<name>].tokens_per_percent — to the "
+                "observed value before enabling this. Lowering min_token_target instead re-opens "
+                "the overshoot this feature exists to close; see Config.min_token_target."
+            )
 
 
 def _read_toml(path: Path) -> dict[str, Any]:
@@ -265,6 +546,20 @@ def load_config(
         if "adopt_default" in defaults:
             mode = str(defaults["adopt_default"]).strip().lower()
             cfg.adopt_default = mode if mode in ("always", "if-empty", "never") else "always"
+        if "tokens_per_percent" in defaults:
+            cfg.tokens_per_percent = _to_float(
+                defaults["tokens_per_percent"], "[defaults].tokens_per_percent"
+            )
+        if "headroom_safety_pct" in defaults:
+            cfg.headroom_safety_pct = _to_float(
+                defaults["headroom_safety_pct"], "[defaults].headroom_safety_pct"
+            )
+        if "min_token_target" in defaults:
+            cfg.min_token_target = _to_int(
+                defaults["min_token_target"], "[defaults].min_token_target"
+            )
+        if "derive_token_target" in defaults:
+            cfg.derive_token_target = bool(defaults["derive_token_target"])
 
     seats_raw = raw.get("seats") or {}
     if isinstance(seats_raw, dict):
@@ -279,6 +574,14 @@ def load_config(
                 ),
                 exclude=bool(seat_table.get("exclude", False)),
                 main=bool(seat_table.get("main", False)),
+                tokens_per_percent=(
+                    _to_float(
+                        seat_table["tokens_per_percent"],
+                        f"[seats.{seat_name}].tokens_per_percent",
+                    )
+                    if "tokens_per_percent" in seat_table
+                    else None
+                ),
             )
 
     gadkit = raw.get("gadkit") or {}

@@ -180,8 +180,36 @@ _GAD_RUN_RESULT_STATUSES = frozenset(
         # `gadkit.blocking_decisions()` preflight gate and gad-generation.js's internal one ever
         # disagree on what counts as "still open."
         "AWAITING-OWNER",
+        # gad-kit's soft usage ceiling (2026-07-30). `PAUSED` is gad-generation.js's/gad-finish.js's
+        # own top-level status when a phase-boundary gate fired — or when runAgent() caught a hard
+        # `budget` throw and reported it honestly rather than as a dead agent. `PAUSED-ON-BUDGET` is
+        # gad-run.js's `stopReason` for the same event one level up. Neither is a failure: the
+        # generation stopped ITSELF, with its artifacts written, and is resumable.
+        # `GENERATION-THREW` is gad-run.js's new guard around `await workflow(...)` — a child
+        # generation threw and the crawl reported it with earlier generations' accounting intact
+        # instead of letting the throw destroy the whole batch.
+        "PAUSED",
+        "PAUSED-ON-BUDGET",
+        "GENERATION-THREW",
     }
 )
+
+# The subset above meaning "this SEAT is spent but the WORK is healthy". Never retry these on the
+# same seat: the pause fired precisely because headroom ran out, so an immediate retry re-hits the
+# identical gate at the identical place, makes no progress, and burns the retry budget into a
+# HARD_ERROR park — the exact outcome the soft ceiling exists to prevent.
+#
+# `BUDGET-EXHAUSTED` belongs here even though it predates this feature, and its inclusion is a FIX,
+# not tidying. It is gad-run's own "I cannot afford to START the next generation" exit, which is
+# semantically a pause — but until the soft ceiling landed it was unreachable dead code, because the
+# gate behind it read `budget.total && budget.remaining() < perGenTokens` and `budget.total` is
+# permanently null (see Config.tokens_per_percent). Rebuilding that gate on `budget.spent()` made it
+# live for the first time, and as a bare member of `_GAD_RUN_RESULT_STATUSES` it classified as an
+# ordinary RETRY: no cooldown (the `_force_cooldown` in run_once is keyed on CONTINUE_ROTATE), so
+# pick_seat re-selects the same seat — whose percent has barely moved, since the run exited before
+# doing any work — it exhausts again immediately, and three iterations later the HARD_ERROR breaker
+# parks the whole repo. A healthy budget stop must never look like a crash loop.
+_PAUSED_RESULT_STATUSES = frozenset({"PAUSED", "PAUSED-ON-BUDGET", "BUDGET-EXHAUSTED"})
 
 # The model's own terminal line is `RESULT: <status>` (gadkit.command() Step 3, verbatim).
 _RESULT_LINE_RE = re.compile(r"^\s*RESULT\s*:\s*(.*)$", re.IGNORECASE)
@@ -280,6 +308,20 @@ class Action:
     # start, e.g. DIRTY-TREE) — `loop.run()` trips the HARD_ERROR breaker on the first occurrence
     # instead of wasting `_MAX_CONSECUTIVE_AGENT_DEAD` cycles first.
     no_retry: bool = False
+    # True iff gad-kit's own soft usage ceiling fired (RESULT: PAUSED / PAUSED-ON-BUDGET). This is
+    # deliberately ORTHOGONAL to `kind`, because a pause can accompany EITHER bucket:
+    #
+    #   * `AGENT_DEAD_NONLIMIT` — the generation paused before committing anything (kind becomes
+    #     CONTINUE_ROTATE), and
+    #   * `PROGRESSED` — gad-run committed one or more generations and THEN paused on the next
+    #     one (kind stays CONTINUE, because a commit did land and that is real progress).
+    #
+    # The second case is why this cannot be inferred from `kind` alone. Both cases mean the SAME
+    # thing about the seat: its headroom is gone, so `run_once()` must cool it off, and
+    # `loop.run()` must NOT count the rotation toward the HARD_ERROR breaker — a pause is the
+    # mechanism working, and several seats pausing in a row is the expected steady state near a
+    # fleet-wide ceiling, not a crash loop.
+    paused: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -595,6 +637,22 @@ def classify(outcome: str, usage: UsageSnapshot | None, tail: list[str]) -> Acti
     nothing else in this package re-implements it (DESIGN.md §2).
     """
     if outcome == "PROGRESSED":
+        # A commit landed, so this is unambiguously progress and `kind` stays CONTINUE. But
+        # gad-run can commit generation N and then pause on N+1 (its soft ceiling is checked at
+        # every phase boundary of every generation in the crawl, not once per launch), and that
+        # combination reaches here — the AGENT_DEAD_NONLIMIT branch below never runs. Without
+        # this check the loop would happily re-select the SAME just-exhausted seat for the
+        # resume, which pauses again immediately at the same gate: a launch spent per iteration
+        # for nothing. Flagging it lets `run_once()` cool the seat while still crediting the
+        # commit.
+        if _extract_gad_result_status(tail) in _PAUSED_RESULT_STATUSES:
+            return Action(
+                CONTINUE,
+                "new commit landed, and gad-kit's own RESULT then reported a soft-ceiling PAUSE — "
+                "real progress, but this seat's headroom is spent; cooling it off so the resume "
+                "lands on a seat that can actually finish the next generation",
+                paused=True,
+            )
         return Action(CONTINUE, "new commit landed")
     if outcome == "HIT_WALL":
         return Action(CONTINUE_ROTATE, "active usage near cap — cooldown recorded, rotating")
@@ -648,6 +706,16 @@ def classify(outcome: str, usage: UsageSnapshot | None, tail: list[str]) -> Acti
                 "artifact-census fix in gadkit.py's `verify_or_later` is the primary defense; "
                 "this is the backstop for whenever that gate is somehow still wrong)",
                 no_retry=True,
+            )
+        if status in _PAUSED_RESULT_STATUSES:
+            return Action(
+                CONTINUE_ROTATE,
+                f"gad-kit's own RESULT reported {status!r} — its soft usage ceiling fired at a "
+                "phase boundary, so the generation stopped itself deliberately with its artifacts "
+                "written and is resumable. This is healthy, NOT a failure: no commit is expected "
+                "yet, and retrying on THIS seat would re-hit the same gate at the same place. "
+                "Rotate to a seat with headroom and let the next triage() resume the generation.",
+                paused=True,
             )
         if status is not None:
             if status in _GAD_RUN_RESULT_STATUSES:
