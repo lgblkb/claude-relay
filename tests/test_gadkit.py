@@ -891,12 +891,18 @@ class ResolveOwnerDecisionCommitFailureTests(unittest.TestCase):
         self.assertTrue(any("generations-index.json" in line for line in status), status)
 
     def test_no_git_identity_leaves_the_write_applied_but_uncommitted(self) -> None:
-        # `user.useConfigOnly = true` forces git to REFUSE to guess an identity from GECOS/
-        # hostname fallback, so this reproduces deterministically regardless of the host's own
-        # global ~/.gitconfig.
-        _run_git(self.repo, "config", "--unset", "user.name")
-        _run_git(self.repo, "config", "--unset", "user.email")
+        # Two mechanisms, both needed — `--unset` + `useConfigOnly` alone was NOT enough (fixed
+        # 2026-07-29, after this test failed on a host with a global identity configured):
+        #   - `user.useConfigOnly = true` stops git guessing an identity from GECOS/hostname, but
+        #     it explicitly PERMITS a config-provided one — which is all a global ~/.gitconfig is.
+        #     Unsetting the LOCAL keys therefore just let the global values take over and the
+        #     commit SUCCEEDED, so the failure only reproduced on a host with no global identity.
+        #   - Setting the local keys EMPTY (rather than unsetting them) shadows any global value
+        #     with one git refuses outright ("Author identity unknown" / "empty ident name ... not
+        #     allowed"), which is what makes this deterministic on every host.
         _run_git(self.repo, "config", "user.useConfigOnly", "true")
+        _run_git(self.repo, "config", "user.name", "")
+        _run_git(self.repo, "config", "user.email", "")
         result = gadkit.resolve_owner_decision(self.repo, "D1", "use postgres")
         self.assertTrue(result.found)
         self.assertFalse(result.committed)
@@ -2124,6 +2130,16 @@ class InstalledGadKitStatusVocabularyContractTests(unittest.TestCase):
         # NOTE: the RELATED token 'STOPPED-ON-BLOCKED' above is a real gad-run.js stop reason and is
         # allowlisted for a completely different, conditional reason — do not conflate the two.
         "STOP": "agent-prose imperative, a source comment, and the STOP_ON_BLOCKED config identifier",
+        # --- added 2026-07-29, first run of this test against installed gad-kit 2.2.0 ---
+        # A shell HEREDOC DELIMITER, not a status. gad-generation.js:654 builds a Bash command
+        # string ending `cat > '<gen>/reviews/adversarial-review.md' <<'TOMBSTONE_EOF' ...
+        # TOMBSTONE_EOF` to write the agent-dead adversarial-review tombstone. The over-inclusive
+        # regex matches the OPENING delimiter only, because heredoc quoting puts it in single
+        # quotes (the closing one is bare and never matches). It is file-writing syntax inside an
+        # agent instruction, not a value in any schema field — and the status-shaped token in that
+        # tombstone (`verdict: SKIPPED`) is plain file CONTENT too, never a RESULT line. Same shape
+        # as the 'ADAPT' entry above (a marker in generated content).
+        "TOMBSTONE_EOF": "a shell heredoc delimiter in gad-generation.js's tombstone writer, never a status",
     }
 
     def setUp(self) -> None:

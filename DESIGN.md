@@ -147,6 +147,24 @@ Phase 2 because it needs sound per-unit cost calibration, which v1 does not have
   supervisor treats as "full." Doubles as a cheap TEST lever (set ~20–30% to trigger
   rotation fast without +2M / real limits). Per-seat + runtime overridable
   (`--ceiling <seat>=<pct>`).
+- **401 refresh budget — what a "strike" means (corrected 2026-07-30).** An idle seat's *access*
+  token expires while its *refresh* token stays valid, so its usage poll 401s. The only thing that
+  refreshes it is a `claude` launch, so `pick_seat` may hand such a seat back as a **last resort**
+  (never outcompeting a live reading), bounded by `_MAX_AUTH_REFRESH_ATTEMPTS = 3`. That budget is
+  charged **only for the seat actually handed back for a launch** — never merely for observing a
+  401 during the per-seat scan. Charging on the scan (the original B8 shape) meant a seat that
+  401'd while a healthy sibling existed paid for a recovery attempt that never happened; and since
+  selection deliberately concentrates work on the seat with the soonest reset, every idle seat was
+  on a deterministic path to permanent lockout plus a false "log in again" alert. A 401 seen on a
+  healthy-pool iteration is surfaced as an `auth-stale:` note instead. Tradeoff accepted: a
+  genuinely dead `refresh_token` reaches the operator alert more slowly, because it must actually
+  be *needed* three times first — which is the all-seats-down case B8 already covers.
+- **Adopted seats decay.** `claude-relay adopt` *copies* `~/.claude/.credentials.json` into the
+  seat, so the copy never sees the source account's later refreshes and its snapshot refresh token
+  can be superseded. `login-check` still reports such a seat `usable` (it only checks file
+  presence), so the decay is invisible until a poll 401s. Repair is `claude-relay adopt` again, not
+  a fresh `claude` login at that `CLAUDE_CONFIG_DIR` — logging in there mints a *second*
+  independent credential lineage for one account, which is how the divergence arises.
 - **When to rotate off / not start:** read the seat's live `limits[]`; the `is_active`
   session `percent`/`severity` are the measurement. Rotate-off / don't-start when
   `percent >= ceiling_pct(seat)` or `severity != normal`. Also gate on `weekly_all` + any
