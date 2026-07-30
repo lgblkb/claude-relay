@@ -133,7 +133,8 @@ class ParseTokenTargetTests(unittest.TestCase):
 class LaunchBudgetTests(unittest.TestCase):
     def _cfg(self, **kw: object) -> Config:
         """Fixtures pin `min_token_target` explicitly wherever the floor is load-bearing. The
-        SHIPPED default is 860_000 — a whole clean generation, see Config.min_token_target — which is
+        SHIPPED default is 200_000 — gad-kit's own perGenTokens figure, see Config.min_token_target —
+        which is
         deliberately far above these illustrative arithmetic cases; `ShippedDefaultsTests` covers the
         real defaults separately, since a fixture that quietly replaced them is exactly how the
         "no seat is ever startable" trap went unnoticed.
@@ -249,7 +250,7 @@ class ShippedDefaultsTests(unittest.TestCase):
         message = str(caught.exception)
         # The error has to name the fix, not just the symptom.
         self.assertIn("tokens_per_percent", message)
-        self.assertIn("calibration.jsonl", message)
+        self.assertIn("perf-history.jsonl", message)
 
     def test_a_measured_rate_makes_seats_startable_again(self) -> None:
         cfg = Config()
@@ -274,16 +275,17 @@ class ShippedDefaultsTests(unittest.TestCase):
         otherwise every existing installation would fail to load."""
         config_mod._validate(Config())
 
-    def test_the_floor_covers_a_whole_clean_generation(self) -> None:
+    def test_the_floor_matches_gad_kits_own_per_generation_figure(self) -> None:
         """The floor is the PRIMARY enforcement mechanism, because gad-kit's pre-Verify gates are
         disabled for resume safety and a generation whose Verify is clean on the first iteration
-        never consults the allowance at all. So the floor must cover gad-kit's full PHASE_TOKENS for
-        a clean run — Plan 60k + PlanReview 90k + Prep 60k + Implement 300k + Guardrails 120k +
-        Verify 150k + Consolidate 80k = 860k. Drop it materially below that and the run sails past
-        every disabled gate while the allowance bounds nothing, which is the exact overshoot this
-        feature exists to close.
+        never consults the allowance at all.
+
+        It must equal gad-kit's own `perGenTokens` default. The two sides both decide "can a
+        generation be afforded" — relay for the launch, gad-kit for the next generation in its crawl
+        — and if relay's figure were the LARGER one it would hand over allowances gad-kit then
+        refuses to begin, burning a launch to do nothing.
         """
-        self.assertGreaterEqual(Config().min_token_target, 860_000)
+        self.assertEqual(Config().min_token_target, 200_000)
 
 
 class SoftCeilingConfigValidationTests(unittest.TestCase):
@@ -491,7 +493,7 @@ class LaunchGateTests(unittest.TestCase):
 
     # 'spent' at 18%: under its 20% start cap (25 - 5 margin), so every pre-existing check passes
     # it, but only 2% of headroom is left below its ceiling (25 - 18 - 5 safety) = 60k tokens,
-    # far under the 860k floor. 'rich' at 30%: 35% of headroom * 30k = 1.05M, comfortably startable.
+    # far under the 200k floor. 'rich' at 30%: 35% of headroom * 30k = 1.05M, comfortably startable.
     _SPENT_PCT = 18.0
     _RICH_PCT = 30.0
 
@@ -613,54 +615,146 @@ class RunOnceAllowanceTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class CalibrationReadTests(unittest.TestCase):
+class PerfHistoryReadTests(unittest.TestCase):
+    """`.gad/perf-history.jsonl` is gad-kit's OWN cost ledger, written by its consolidator since
+    v1.3 for its adaptive `perGenTokens` forecaster. relay reads it rather than asking gad-kit to
+    write a second, relay-specific file — which would have cost an extra agent call per run, since
+    workflow scripts have no filesystem access.
+    """
+
+    @staticmethod
+    def _line(**kw: object) -> str:
+        """One realistic consolidator-written line. Field names are gad-kit's, verbatim from its
+        `perfLine` construction — this is a cross-repo contract, so the names matter."""
+        record = {
+            "gen": 7,
+            "genType": "build",
+            "profile": "budget",
+            "milestone": False,
+            "tokensByPhase": {"Implement": 300000, "Verify": 150000},
+            "tokensThroughRefactor": 450000,
+            "verifyIterations": 1,
+            "fixEscalated": False,
+            "preMortemDied": False,
+            "outcome": "COMMITTED",
+        }
+        record.update(kw)  # type: ignore[arg-type]
+        return json.dumps(record)
+
     def _repo(self, tmp: str, lines: list[str]) -> pathlib.Path:
         repo = pathlib.Path(tmp)
         (repo / ".gad").mkdir(parents=True, exist_ok=True)
-        gadkit.calibration_path(repo).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        gadkit.perf_history_path(repo).write_text("\n".join(lines) + "\n", encoding="utf-8")
         return repo
 
-    def test_the_last_good_record_is_read(self) -> None:
+    def test_records_are_read_oldest_first_with_gad_kits_field_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = self._repo(
                 tmp,
                 [
-                    json.dumps({"spentOutputTokens": 111, "status": "OLD", "gensCommitted": 1}),
-                    json.dumps({"spentOutputTokens": 222, "status": "PAUSED-ON-BUDGET", "gensCommitted": 2}),
+                    self._line(gen=6, tokensThroughRefactor=111_000),
+                    self._line(gen=7, tokensThroughRefactor=222_000, outcome="BLOCKED"),
                 ],
             )
-            cal = gadkit.read_calibration(repo)
-            assert cal is not None
-            self.assertEqual(cal.spent_output_tokens, 222)
-            self.assertEqual(cal.status, "PAUSED-ON-BUDGET")
-            self.assertEqual(cal.gens_committed, 2)
-            self.assertEqual(cal.records, 2)
-            self.assertEqual(gadkit.calibration_record_count(repo), 2)
+            records = gadkit.read_perf_history(repo)
+            self.assertEqual([r.gen for r in records], [6, 7])
+            self.assertEqual(records[-1].tokens, 222_000)
+            self.assertEqual(records[-1].outcome, "BLOCKED")
+            self.assertTrue(records[-1].is_full_generation)
 
-    def test_one_bad_append_does_not_discard_a_good_earlier_record(self) -> None:
-        """The file is written by an agent appending a line, so a truncated or garbage line is a
-        realistic failure mode — and it must not cost us the calibration we already had."""
+    def test_one_bad_line_does_not_discard_the_others(self) -> None:
+        """The file is appended by an AGENT following an instruction, so a truncated line, a garbage
+        line or a missing field are all realistic — and none may cost us the history we do have."""
         with tempfile.TemporaryDirectory() as tmp:
             repo = self._repo(
                 tmp,
                 [
-                    json.dumps({"spentOutputTokens": 333, "status": "COMPLETED"}),
-                    '{"spentOutputTokens": 44',  # truncated mid-write
+                    self._line(gen=1, tokensThroughRefactor=100_000),
+                    '{"gen": 2, "tokensThroughRefactor": 44',  # truncated mid-write
                     "not json at all",
-                    json.dumps({"status": "no tokens key"}),
-                    json.dumps({"spentOutputTokens": -5}),
-                    json.dumps({"spentOutputTokens": "banana"}),
+                    json.dumps({"gen": 3, "genType": "build"}),  # no token count
+                    self._line(gen=4, tokensThroughRefactor=-5),  # nonsensical
+                    self._line(gen=5, tokensThroughRefactor="banana"),
+                    self._line(gen=6, tokensThroughRefactor=200_000),
                 ],
             )
-            cal = gadkit.read_calibration(repo)
-            assert cal is not None
-            self.assertEqual(cal.spent_output_tokens, 333)
+            self.assertEqual([r.gen for r in gadkit.read_perf_history(repo)], [1, 6])
 
-    def test_a_missing_file_is_simply_no_calibration(self) -> None:
+    def test_a_missing_file_is_simply_no_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            repo = pathlib.Path(tmp)
-            self.assertIsNone(gadkit.read_calibration(repo))
-            self.assertEqual(gadkit.calibration_record_count(repo), 0)
+            self.assertEqual(gadkit.read_perf_history(pathlib.Path(tmp)), [])
+
+    def test_tail_only_and_ideation_runs_are_not_full_generations(self) -> None:
+        """gad-kit's own audit (C8) names these as the records that "further depress the window":
+        a gad-finish tail and a research ideation generation cost a fraction of a full build, so
+        counting them when asking what a WHOLE generation costs understates the floor."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(
+                tmp,
+                [
+                    self._line(gen=1, resumedByFinish=True),
+                    self._line(gen=2, genType="ideation"),
+                    self._line(gen=3),
+                ],
+            )
+            full = [r.gen for r in gadkit.read_perf_history(repo) if r.is_full_generation]
+            self.assertEqual(full, [3])
+
+
+class AdaptiveGenerationCostTests(unittest.TestCase):
+    """Mirrors gad-kit's own adaptive `perGenTokens` rule — worst of the recent window x1.15 — on
+    purpose. If relay and gad-kit disagreed about what a generation costs, relay would hand over
+    allowances gad-kit refuses to start on, or refuse to launch runs gad-kit would have completed.
+    """
+
+    def _repo(self, tmp: str, totals: list[int], **kw: object) -> pathlib.Path:
+        repo = pathlib.Path(tmp)
+        (repo / ".gad").mkdir(parents=True, exist_ok=True)
+        lines = [
+            json.dumps(
+                {"gen": i, "genType": "build", "tokensThroughRefactor": t, "outcome": "COMMITTED", **kw}
+            )
+            for i, t in enumerate(totals)
+        ]
+        gadkit.perf_history_path(repo).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return repo
+
+    def test_too_little_history_falls_back_to_the_configured_floor(self) -> None:
+        """Two samples is not evidence; gad-kit requires three for the same reason."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(tmp, [800_000, 900_000])
+            tokens, why = gadkit.adaptive_generation_cost(repo, 200_000)
+            self.assertEqual(tokens, 200_000)
+            self.assertIn("floor", why)
+
+    def test_the_worst_recent_generation_plus_a_margin_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(tmp, [400_000, 900_000, 500_000])
+            tokens, why = gadkit.adaptive_generation_cost(repo, 200_000)
+            self.assertEqual(tokens, int(900_000 * 1.15))
+            self.assertIn("worst", why)
+
+    def test_only_the_most_recent_window_counts(self) -> None:
+        """An ancient expensive generation must not gate launches forever."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(tmp, [9_000_000, 300_000, 300_000, 300_000])
+            tokens, _why = gadkit.adaptive_generation_cost(repo, 200_000)
+            self.assertEqual(tokens, int(300_000 * 1.15))
+
+    def test_the_floor_is_only_ever_raised_never_lowered(self) -> None:
+        """A repo with cheap generations does not license starting a seat that cannot cover the
+        operator's configured minimum."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(tmp, [10_000, 10_000, 10_000])
+            tokens, why = gadkit.adaptive_generation_cost(repo, 200_000)
+            self.assertEqual(tokens, 200_000)
+            self.assertIn("floor", why)
+
+    def test_tail_only_history_alone_does_not_raise_the_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(tmp, [900_000, 900_000, 900_000], resumedByFinish=True)
+            tokens, _why = gadkit.adaptive_generation_cost(repo, 200_000)
+            self.assertEqual(tokens, 200_000)
 
 
 class LearnTokensPerPercentTests(unittest.TestCase):
@@ -682,8 +776,15 @@ class LearnTokensPerPercentTests(unittest.TestCase):
             repo = pathlib.Path(tmp)
             if write_record:
                 (repo / ".gad").mkdir(parents=True, exist_ok=True)
-                gadkit.calibration_path(repo).write_text(
-                    json.dumps({"spentOutputTokens": spent, "status": "PAUSED-ON-BUDGET", "gensCommitted": 1})
+                gadkit.perf_history_path(repo).write_text(
+                    json.dumps(
+                        {
+                            "gen": 7,
+                            "genType": "build",
+                            "tokensThroughRefactor": spent,
+                            "outcome": "COMMITTED",
+                        }
+                    )
                     + "\n",
                     encoding="utf-8",
                 )

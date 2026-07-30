@@ -323,6 +323,8 @@ def pick_seat(
     config: Config,
     *,
     dry_run: bool = False,
+    required_tokens: int | None = None,
+    required_why: str = "",
 ) -> tuple[fleet.Seat | None, usage_mod.UsageSnapshot | None, list[str]]:
     """Among usable, not-in-cooldown seats, prefer the lowest active-session `percent` with
     `percent < ceiling_pct(seat) - start_margin`; if none qualifies, return (None, None, notes)
@@ -402,6 +404,8 @@ def pick_seat(
             seat.name,
             percent,
             learned=cooldown.learned_tokens_per_percent(state, seat.path),
+            required_tokens=required_tokens,
+            required_why=required_why,
         )
         if not launch_budget.startable:
             notes.append(f"below-token-floor: {seat.name}: {launch_budget.reason}")
@@ -603,7 +607,13 @@ def run_once(
 
     seats = fleet.discover_seats(config.effective_exclude())
     sync_seat_login_state(state, seats)
-    seat, _seat_usage, notes = pick_seat(seats, state, cache, config)
+    # What a generation costs ON THIS REPO — measured from `.gad/perf-history.jsonl` where enough
+    # history exists, otherwise the configured floor. Computed once here and used for BOTH the seat
+    # gate and the launch decision below, so the two cannot disagree within one iteration.
+    required_tokens, required_why = gadkit.adaptive_generation_cost(repo, config.min_token_target)
+    seat, _seat_usage, notes = pick_seat(
+        seats, state, cache, config, required_tokens=required_tokens, required_why=required_why
+    )
     if seat is None:
         # `triage()` must book a research repo's one-per-HEAD backlog-refill attempt at decision
         # time (it is the only place holding `state`), but nothing was spent here — every seat is
@@ -637,7 +647,11 @@ def run_once(
     # away and take the wait path, never launch with a budget we just judged unfundable.
     seat_percent = None if _seat_usage is None else usage_mod.session_percent(_seat_usage)
     launch_budget = config.launch_budget_for(
-        seat.name, seat_percent, learned=cooldown.learned_tokens_per_percent(state, seat.path)
+        seat.name,
+        seat_percent,
+        learned=cooldown.learned_tokens_per_percent(state, seat.path),
+        required_tokens=required_tokens,
+        required_why=required_why,
     )
     if not launch_budget.startable:
         _force_cooldown(state, seat)
@@ -659,7 +673,7 @@ def run_once(
         )
 
     pre = gadkit.snapshot(repo)
-    calibration_before = gadkit.calibration_record_count(repo)
+    perf_records_before = len(gadkit.read_perf_history(repo))
     argv = gadkit.command(plan)
     plugin_dirs = [str(p) for p in plugins.resolve_plugin_dirs(config.plugin_dirs)]
     result = runner.run(
@@ -728,11 +742,11 @@ def run_once(
             if reset_dt is not None:
                 resets_at = reset_dt.isoformat()
         _force_cooldown(state, seat, resets_at=resets_at)
-        _learn_tokens_per_percent(state, seat, repo, calibration_before, _seat_usage, post_usage)
+        _learn_tokens_per_percent(state, seat, repo, perf_records_before, _seat_usage, post_usage)
     elif outcome_bucket == "PROGRESSED":
         # A completed, committed run is also a valid calibration sample — in fact the best kind,
         # since it spans a whole generation rather than a truncated one.
-        _learn_tokens_per_percent(state, seat, repo, calibration_before, _seat_usage, post_usage)
+        _learn_tokens_per_percent(state, seat, repo, perf_records_before, _seat_usage, post_usage)
 
     return IterationResult(
         plan=plan, action=action, seat=seat, run_result=result, outcome=outcome_bucket, seat_notes=notes
@@ -747,7 +761,7 @@ def run_once(
 _TOKENS_PER_PCT_EWMA_ALPHA = 0.3
 # Reject observations outside this band as measurement error rather than learning from them. The
 # span is deliberately wide (three orders of magnitude): its job is to catch a nonsense pairing —
-# a percent delta of ~0 with real spend, a stale calibration record, two seats' runs interleaved —
+# a percent delta of ~0 with real spend, a stale perf-history record, two seats' runs interleaved —
 # not to encode an opinion about what a plausible rate is, which is the very thing being measured.
 _TOKENS_PER_PCT_MIN = 50.0
 _TOKENS_PER_PCT_MAX = 50_000.0
@@ -760,26 +774,33 @@ def _learn_tokens_per_percent(
     state: dict[str, Any],
     seat: fleet.Seat,
     repo: Path,
-    calibration_before: int,
+    perf_records_before: int,
     pre_usage: usage_mod.UsageSnapshot | None,
     post_usage: usage_mod.UsageSnapshot | None,
 ) -> None:
     """Fold this run into `seat`'s learned output-tokens-per-percent, if it is measurable.
 
-    Pairs the two halves of the observation that no single component can see on its own: how many
-    OUTPUT TOKENS the run spent (only gad-kit knows — it reads `budget.spent()` from inside the
-    workflow and appends it to `.gad/calibration.jsonl`) against how much of the five-hour WINDOW
-    that consumed (only relay knows, from its pre/post usage polls of this seat).
+    Pairs the two halves of an observation neither side can make alone: how many OUTPUT TOKENS the
+    run spent (only gad-kit knows — it reads `budget.spent()` from inside the workflow and its
+    consolidator appends the total to `.gad/perf-history.jsonl`) against how much of the five-hour
+    WINDOW that consumed (only relay knows, from its own pre/post usage polls of this seat).
 
-    Silently does nothing whenever the observation is not trustworthy — a missing or stale
-    calibration record, an unreadable usage poll, a percent delta too small to divide by, or a
-    resulting rate outside `_TOKENS_PER_PCT_MIN.._MAX`. Calibration is advisory: a run that teaches
-    us nothing is normal and must never be an error, and a bad sample is far worse than no sample,
-    because too LOW a learned rate makes the seat unstartable.
+    Silently does nothing whenever the observation is not trustworthy — a missing or stale record, an
+    unreadable usage poll, a percent delta too small to divide by, or a resulting rate outside
+    `_TOKENS_PER_PCT_MIN.._MAX`. Calibration is advisory: a run that teaches us nothing is normal and
+    must never be an error, and a bad sample is far worse than no sample, because too LOW a learned
+    rate makes the seat unstartable.
+
+    Tail-only and ideation records are deliberately NOT filtered out here, unlike in
+    `gadkit.adaptive_generation_cost()`: they cost less in absolute terms, but their percent delta
+    shrinks with their token count, so the RATIO they yield is still a valid sample. See
+    `gadkit.PerfRecord` for the one bias that does survive (consolidate's own tokens are missing from
+    every record, so every rate learned here is a lower bound).
     """
-    calibration = gadkit.read_calibration(repo)
-    if calibration is None or calibration.records <= calibration_before:
-        return  # no record, or only the stale one an earlier launch left behind
+    records = gadkit.read_perf_history(repo)
+    if len(records) <= perf_records_before:
+        return  # nothing new — only records earlier launches left behind
+    record = records[-1]
     if pre_usage is None or post_usage is None:
         return
     pct_delta = usage_mod.session_percent(post_usage) - usage_mod.session_percent(pre_usage)
@@ -787,11 +808,11 @@ def _learn_tokens_per_percent(
         # Also catches the negative case: the window reset mid-run, so post is a fresh window and
         # the delta is meaningless rather than merely small.
         return
-    observed = calibration.spent_output_tokens / pct_delta
+    observed = record.tokens / pct_delta
     if not (_TOKENS_PER_PCT_MIN <= observed <= _TOKENS_PER_PCT_MAX):
         print(
             f"[claude-relay] seat={seat.name} discarding an implausible calibration sample "
-            f"({calibration.spent_output_tokens} output tokens / {pct_delta:.1f}% = "
+            f"({record.tokens} output tokens / {pct_delta:.1f}% = "
             f"{observed:.0f}/pct, outside {_TOKENS_PER_PCT_MIN:.0f}..{_TOKENS_PER_PCT_MAX:.0f})",
             flush=True,
         )
@@ -805,9 +826,11 @@ def _learn_tokens_per_percent(
     cooldown.update_seat(state, seat.path, tokens_per_percent=blended)
     print(
         f"[claude-relay] seat={seat.name} tokens-per-pct observed={observed:.0f} "
-        f"(spent={calibration.spent_output_tokens} over {pct_delta:.1f}%, "
-        f"status={calibration.status!r}, gens={calibration.gens_committed}) "
-        f"learned={blended:.0f}" + ("" if previous is None else f" (was {previous:.0f})"),
+        f"(gen {record.gen} cost {record.tokens} over {pct_delta:.1f}%, type={record.gen_type!r}, "
+        f"outcome={record.outcome!r}"
+        + (", tail-only" if record.resumed_by_finish else "")
+        + f") learned={blended:.0f}"
+        + ("" if previous is None else f" (was {previous:.0f})"),
         flush=True,
     )
 

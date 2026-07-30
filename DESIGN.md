@@ -766,7 +766,9 @@ the tree and restarts from Preflight — with nothing ever popping that stash). 
 Verify is clean on the first iteration therefore never consults the allowance at all. What bounds
 THAT run is the launch gate: `pick_seat()` skips any seat whose headroom is worth less than
 `min_token_target`, whose default is gad-kit's own `phaseTokens` summed over a clean generation
-(860k) — read it as **"only start a seat that can afford a whole generation."** The pause covers the
+(matching gad-kit's own `perGenTokens` default, and RAISED to the worst of the last three real
+generations x1.15 wherever `.gad/perf-history.jsonl` supplies them) — read it as **"only start a seat
+that can afford a whole generation."** The pause covers the
 tail the launch gate cannot predict: a verify loop that keeps finding work. `_validate()` rejects an
 arithmetically unsatisfiable config (best case under the highest ceiling still below the floor),
 since that would idle the pool permanently and unrecoverably — an unlaunched seat never writes a
@@ -779,7 +781,8 @@ advanced, which is precisely why a flat per-launch allowance is correct even for
 multi-generation crawl: parent and children share the one counter and draw down one pool.
 
 The conversion rate (`tokens_per_percent`) is MEASURED, not configured: gad-run writes its true
-`budget.spent()` to `.gad/calibration.jsonl`, and `loop._learn_tokens_per_percent()` divides it by
+`budget.spent()` to `.gad/perf-history.jsonl` — its OWN pre-existing cost ledger, not a
+relay-specific file — and `loop._learn_tokens_per_percent()` divides it by
 the seat's observed percent delta for the same run, then folds the result into a per-seat learned
 rate held in state. A disk fact, not model prose — Invariant #2 holds. Off by default
 (`derive_token_target = false`): with it off no allowance arg is passed and every gate is inert.
@@ -845,8 +848,8 @@ max_units  = 0                    # 0 = until DONE
 [defaults] derive_token_target = false            # soft usage ceiling — OFF until tokens_per_percent
            tokens_per_percent = 1200              # is LEARNED per seat (see §5 tokenAllowance);
            headroom_safety_pct = 5                # aim below the ceiling, overshoot is the bad way
-           min_token_target = 860000              # headroom worth less than this ⇒ SKIP the seat
-                                                  # (= a whole clean generation; the PRIMARY gate)
+           min_token_target = 200000              # FLOOR for "a generation"; the PRIMARY gate.
+                                                  # perf-history.jsonl raises it to measured cost
 [seats.almas] ceiling_pct = 70                    # per-seat override; --ceiling to override at runtime
 [seats.sam]   tokens_per_percent = 30000          # pin a known tier, overriding what was learned
 [seats.dias]  main = true                         # reserved: excluded from automation

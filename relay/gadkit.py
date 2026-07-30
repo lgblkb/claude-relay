@@ -458,49 +458,73 @@ def handoff_path(repo: Path, gen: int) -> Path:
     return generation_dir(repo, gen) / "handoff.md"
 
 
-def calibration_path(repo: Path) -> Path:
-    """Where gad-run appends one JSON line per completed crawl recording its true
-    `budget.spent()`. Repo-level, not per-generation: a single launch's crawl can span several
-    generations and the figure is per-LAUNCH.
+def perf_history_path(repo: Path) -> Path:
+    """`.gad/perf-history.jsonl` — gad-kit's OWN per-generation cost ledger, which its consolidator
+    appends one line to per generation (see gad-kit's `perfLine`).
+
+    relay does not create this file and must not: gad-kit has written it since v1.3 for its own
+    adaptive `perGenTokens` forecaster, so a second relay-specific telemetry file would be pure
+    duplication — and would need an extra agent call per run to write it, since workflow scripts have
+    no filesystem access.
     """
-    return Path(repo) / ".gad" / "calibration.jsonl"
+    return Path(repo) / ".gad" / "perf-history.jsonl"
 
 
 @dataclasses.dataclass(frozen=True)
-class Calibration:
-    """One `.gad/calibration.jsonl` record — how many OUTPUT tokens a launch actually spent.
+class PerfRecord:
+    """One `.gad/perf-history.jsonl` line: what a generation actually cost, in OUTPUT tokens.
 
-    This exists because the number is otherwise unobtainable. `budget.spent()` is readable only
-    from inside a workflow script, and the run's own NDJSON usage envelopes cover just the
-    supervising `-p` wrapper turn (measured: 1,676 output tokens reported for a run that really
-    cost ~1.1M tokens of all types, because subagent usage never lands in the top-level envelope).
-    So gad-kit writes it to disk and relay reads it back — a durable disk fact, not model prose,
-    which keeps the calibration path on the right side of Invariant #2.
+    relay needs this because the number is otherwise unobtainable. `budget.spent()` is readable only
+    from inside a workflow script, and a run's own NDJSON usage envelopes cover just the supervising
+    `-p` wrapper turn — measured, a run that really cost ~1.1M tokens of all types reported 1,676
+    output tokens, because subagent usage never lands in the top-level envelope. gad-kit writes the
+    real figure to disk; relay reads it back. A durable disk fact, not model prose, so the
+    calibration path stays on the right side of Invariant #2.
 
-    `records` is the total line count, which is how `run_once()` tells a FRESH record from a stale
-    one left by an earlier launch: only a strictly higher count after a run means this run wrote it.
+    ⚠️ `tokens` is a LOWER BOUND on a generation's true cost, by construction: gad-kit builds the line
+    BEFORE its consolidator runs, so the consolidate phase's own tokens are missing from it
+    (chicken-and-egg, conceded in gad-kit's source and filed as MEDIUM C8 in its 2026-07-26 audit,
+    which puts the gap at plausibly >15% of a budget generation). Both consumers must account for it:
+      * The tokens-per-percent RATIO is biased LOW, because the numerator stops at refactor while
+        relay's percent delta covers the whole run including consolidate. A low rate yields small
+        allowances and less-startable seats — conservative for the ceiling, costly for throughput.
+      * The absolute floor is likewise low, which is why `adaptive_generation_cost()` keeps gad-kit's
+        own ×1.15 margin rather than inventing a different one.
+
+    `resumed_by_finish` marks a gad-finish TAIL-ONLY run, and `gen_type` distinguishes cheap research
+    `ideation` generations from full `build` ones. Both cost far less than a full generation, so they
+    must be excluded when asking "what does a whole generation cost" — gad-kit's own audit names
+    exactly this ("tail-only and ideation perf-history lines further depress the window"). They are
+    still perfectly good RATIO samples, because their numerator and denominator shrink together.
     """
 
-    spent_output_tokens: int
-    status: str
-    gens_committed: int
-    records: int
+    gen: int | None
+    gen_type: str
+    tokens: int
+    resumed_by_finish: bool
+    outcome: str
+
+    @property
+    def is_full_generation(self) -> bool:
+        return not self.resumed_by_finish and self.gen_type in ("", "build")
 
 
-def read_calibration(repo: Path) -> Calibration | None:
-    """The LAST record in `.gad/calibration.jsonl`, or None if the file is absent/unusable.
+def read_perf_history(repo: Path) -> list[PerfRecord]:
+    """Every usable record in `.gad/perf-history.jsonl`, oldest first; `[]` if absent/unreadable.
 
-    Fully defensive: the file is written by an agent appending a line, so a truncated, duplicated
-    or garbage line is a realistic failure mode, and calibration is advisory data whose absence must
-    never break a run. Scans for the last line that parses AND carries a plausible positive token
-    count, so one bad append does not discard a good earlier record.
+    Fully defensive. The file is appended by an AGENT following an instruction, so a truncated line,
+    a duplicated line, a missing field or an outright garbage line are all realistic; and this is
+    advisory data whose absence or corruption must never break a run. Unusable lines are skipped
+    individually rather than discarding the whole file.
     """
-    path = calibration_path(repo)
     try:
-        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        raw = perf_history_path(repo).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
-        return None
-    for line in reversed(lines):
+        return []
+    records: list[PerfRecord] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
         try:
             obj = json.loads(line)
         except (json.JSONDecodeError, ValueError):
@@ -508,32 +532,54 @@ def read_calibration(repo: Path) -> Calibration | None:
         if not isinstance(obj, dict):
             continue
         try:
-            spent = int(obj["spentOutputTokens"])
+            tokens = int(obj["tokensThroughRefactor"])
         except (KeyError, TypeError, ValueError):
             continue
-        if spent <= 0:
+        if tokens <= 0:
             continue
         try:
-            gens = int(obj.get("gensCommitted", 0))
-        except (TypeError, ValueError):
-            gens = 0
-        return Calibration(
-            spent_output_tokens=spent,
-            status=str(obj.get("status", "")),
-            gens_committed=gens,
-            records=len(lines),
+            gen = int(obj["gen"])
+        except (KeyError, TypeError, ValueError):
+            gen = None
+        records.append(
+            PerfRecord(
+                gen=gen,
+                gen_type=str(obj.get("genType") or ""),
+                tokens=tokens,
+                resumed_by_finish=bool(obj.get("resumedByFinish", False)),
+                outcome=str(obj.get("outcome") or ""),
+            )
         )
-    return None
+    return records
 
 
-def calibration_record_count(repo: Path) -> int:
-    """Cheap pre-run line count for the fresh-record check in `read_calibration`'s docstring."""
-    try:
-        return sum(
-            1 for ln in calibration_path(repo).read_text(encoding="utf-8").splitlines() if ln.strip()
+# How many recent generations the cost forecast looks at, and the margin over the worst of them.
+# Both mirror gad-kit's own adaptive `perGenTokens` rule deliberately: the two sides must agree about
+# what "a generation costs", or relay starts launches gad-kit then refuses to begin (or vice versa).
+# Worst-of-window rather than mean is gad-kit's choice and the right one — verify-loop variance
+# dominates, and sizing to the mean spends the window's tail on a generation that cannot finish.
+_PERF_WINDOW = 3
+_PERF_MARGIN = 1.15
+
+
+def adaptive_generation_cost(repo: Path, floor: int) -> tuple[int, str]:
+    """`(tokens, why)` — what one generation should be assumed to cost on this repo.
+
+    `floor` (relay's `min_token_target`) is the answer until there is real evidence; with at least
+    `_PERF_WINDOW` full-generation samples the worst of them plus a margin wins if it is larger. Only
+    ever raises the floor, never lowers it: a repo whose generations are cheap does not license
+    starting a seat that cannot cover the configured minimum.
+    """
+    full = [r.tokens for r in read_perf_history(repo) if r.is_full_generation][-_PERF_WINDOW:]
+    if len(full) < _PERF_WINDOW:
+        return floor, (
+            f"configured floor (only {len(full)} full-generation cost sample(s) on disk, "
+            f"need {_PERF_WINDOW})"
         )
-    except (OSError, UnicodeDecodeError):
-        return 0
+    observed = int(max(full) * _PERF_MARGIN)
+    if observed <= floor:
+        return floor, f"configured floor (recent generations cost at most {max(full)}, under it)"
+    return observed, f"worst of the last {len(full)} generations ({max(full)}) x{_PERF_MARGIN}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
